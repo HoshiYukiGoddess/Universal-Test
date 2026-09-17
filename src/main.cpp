@@ -23,6 +23,7 @@ namespace UCA
             bool bypassEssentialGate{ true };
             bool traceLifecycle{ true };
             bool finishDyingStage{ true };
+            bool classifyDeathGateEffort{ true };
             float directDamage{ 1000.0F };
             std::uint32_t cooldownMs{ 250 };
         };
@@ -141,6 +142,11 @@ namespace UCA
                     "bFinishDyingStage",
                     true);
 
+            g_config.classifyDeathGateEffort =
+                ReadIniBool(
+                    "bClassifyDeathGateEffort",
+                    true);
+
             g_config.directDamage =
                 std::max(
                     0.0F,
@@ -157,7 +163,7 @@ namespace UCA
                     5000u);
 
             logger::info(
-                "One-Pass Death Bypass config: player={}, damage={}, cooldown={}ms, logHealth={}, killImpl={}, bypassEssential={}, traceLifecycle={}, finishDying={}",
+                "One-Pass Death Bypass config: player={}, damage={}, cooldown={}ms, logHealth={}, killImpl={}, bypassEssential={}, traceLifecycle={}, finishDying={}, classifyEffort={}",
                 g_config.playerHasAbsoluteDamage,
                 g_config.directDamage,
                 g_config.cooldownMs,
@@ -165,7 +171,8 @@ namespace UCA
                 g_config.attemptVanillaKillImpl,
                 g_config.bypassEssentialGate,
                 g_config.traceLifecycle,
-                g_config.finishDyingStage);
+                g_config.finishDyingStage,
+                g_config.classifyDeathGateEffort);
         }
 
         struct AddressInfo
@@ -870,6 +877,668 @@ namespace UCA
 
             return reinterpret_cast<Fn>(
                 previous);
+        }
+
+
+        // -------------------------------------------------------------
+        // One-shot hardware write watch
+        //
+        // The goal is not to bypass anything here.  It observes the exact
+        // instruction(s) that write Actor runtime Essential/Protected and
+        // TESNPC base flags during KillImpl.  That lets one test distinguish
+        // a concentrated gate from a distributed state machine.
+        // -------------------------------------------------------------
+
+        struct DeathFlagWatchHit
+        {
+            std::uintptr_t rip{};
+            DWORD threadId{};
+            std::uint32_t slotMask{};
+            std::uint64_t runtimeFlagsRaw{};
+            std::uint64_t baseFlagsRaw{};
+        };
+
+        constexpr std::size_t kMaxDeathFlagWatchHits = 32;
+
+        std::array<
+            DeathFlagWatchHit,
+            kMaxDeathFlagWatchHits>
+            g_deathFlagWatchHits{};
+
+        volatile LONG g_deathFlagWatchHitCount = 0;
+        volatile LONG g_deathFlagWatchActive = 0;
+
+        std::uintptr_t g_runtimeFlagsWatchAddress{};
+        std::uintptr_t g_baseFlagsWatchAddress{};
+        std::size_t g_runtimeFlagsWatchSize{};
+        std::size_t g_baseFlagsWatchSize{};
+        DWORD g_deathFlagWatchThreadId{};
+
+        PVOID g_deathFlagVEH{};
+
+        struct SavedDebugRegisters
+        {
+            DWORD64 dr0{};
+            DWORD64 dr1{};
+            DWORD64 dr2{};
+            DWORD64 dr3{};
+            DWORD64 dr6{};
+            DWORD64 dr7{};
+            bool valid{};
+        };
+
+        SavedDebugRegisters g_savedDebugRegisters{};
+
+        std::uint64_t ReadSmallRawValue(
+            std::uintptr_t a_address,
+            std::size_t a_size)
+        {
+            std::uint64_t value = 0;
+
+            if (!a_address ||
+                a_size == 0 ||
+                a_size > sizeof(value)) {
+                return value;
+            }
+
+            std::memcpy(
+                &value,
+                reinterpret_cast<
+                    const void*>(
+                        a_address),
+                a_size);
+
+            return value;
+        }
+
+        DWORD64 DebugLengthEncoding(
+            std::size_t a_size)
+        {
+            switch (a_size) {
+            case 1:
+                return 0b00;
+            case 2:
+                return 0b01;
+            case 4:
+                return 0b11;
+            case 8:
+                return 0b10;
+            default:
+                return 0b00;
+            }
+        }
+
+        LONG CALLBACK DeathFlagVectoredHandler(
+            EXCEPTION_POINTERS* a_exception)
+        {
+            if (!a_exception ||
+                !a_exception->ExceptionRecord ||
+                !a_exception->ContextRecord ||
+                a_exception->ExceptionRecord
+                        ->ExceptionCode !=
+                    EXCEPTION_SINGLE_STEP ||
+                ::InterlockedCompareExchange(
+                    &g_deathFlagWatchActive,
+                    0,
+                    0) == 0 ||
+                ::GetCurrentThreadId() !=
+                    g_deathFlagWatchThreadId) {
+
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+
+            auto* context =
+                a_exception->ContextRecord;
+
+            const auto dr6 =
+                static_cast<std::uint64_t>(
+                    context->Dr6);
+
+            std::uint32_t slotMask = 0;
+
+            if ((dr6 & 0x1ULL) != 0) {
+                slotMask |= 0x1u;
+            }
+
+            if ((dr6 & 0x2ULL) != 0) {
+                slotMask |= 0x2u;
+            }
+
+            if (slotMask == 0) {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+
+            const auto index =
+                ::InterlockedIncrement(
+                    &g_deathFlagWatchHitCount) -
+                1;
+
+            if (index >= 0 &&
+                static_cast<std::size_t>(
+                    index) <
+                    g_deathFlagWatchHits.size()) {
+
+                auto& hit =
+                    g_deathFlagWatchHits[
+                        static_cast<std::size_t>(
+                            index)];
+
+                hit.rip =
+                    static_cast<std::uintptr_t>(
+                        context->Rip);
+
+                hit.threadId =
+                    ::GetCurrentThreadId();
+
+                hit.slotMask =
+                    slotMask;
+
+                hit.runtimeFlagsRaw =
+                    ReadSmallRawValue(
+                        g_runtimeFlagsWatchAddress,
+                        g_runtimeFlagsWatchSize);
+
+                hit.baseFlagsRaw =
+                    ReadSmallRawValue(
+                        g_baseFlagsWatchAddress,
+                        g_baseFlagsWatchSize);
+            }
+
+            // Clear status bits so execution can continue while leaving
+            // the two write breakpoints armed.
+            context->Dr6 = 0;
+
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
+        struct DebugRegisterRequest
+        {
+            HANDLE targetThread{};
+            bool arm{};
+            std::uintptr_t runtimeAddress{};
+            std::uintptr_t baseAddress{};
+            std::size_t runtimeSize{};
+            std::size_t baseSize{};
+            bool ok{};
+        };
+
+        DWORD WINAPI DebugRegisterWorker(
+            LPVOID a_parameter)
+        {
+            auto* request =
+                static_cast<
+                    DebugRegisterRequest*>(
+                        a_parameter);
+
+            if (!request ||
+                !request->targetThread) {
+                return 0;
+            }
+
+            if (::SuspendThread(
+                    request->targetThread) ==
+                static_cast<DWORD>(-1)) {
+                return 0;
+            }
+
+            CONTEXT context{};
+            context.ContextFlags =
+                CONTEXT_DEBUG_REGISTERS;
+
+            bool ok =
+                ::GetThreadContext(
+                    request->targetThread,
+                    &context) != FALSE;
+
+            if (ok) {
+                if (request->arm) {
+                    g_savedDebugRegisters.dr0 =
+                        context.Dr0;
+                    g_savedDebugRegisters.dr1 =
+                        context.Dr1;
+                    g_savedDebugRegisters.dr2 =
+                        context.Dr2;
+                    g_savedDebugRegisters.dr3 =
+                        context.Dr3;
+                    g_savedDebugRegisters.dr6 =
+                        context.Dr6;
+                    g_savedDebugRegisters.dr7 =
+                        context.Dr7;
+                    g_savedDebugRegisters.valid =
+                        true;
+
+                    context.Dr0 =
+                        request->runtimeAddress;
+
+                    context.Dr1 =
+                        request->baseAddress;
+
+                    context.Dr6 = 0;
+
+                    // Preserve DR2/DR3 and their control fields, replace
+                    // only slots 0 and 1.
+                    context.Dr7 &=
+                        ~((0x3ULL << 0) |
+                          (0x3ULL << 2) |
+                          (0xFULL << 16) |
+                          (0xFULL << 20));
+
+                    // Local enable DR0/DR1.
+                    context.Dr7 |=
+                        (1ULL << 0) |
+                        (1ULL << 2);
+
+                    // RW=01 means write. LEN uses Intel encoding.
+                    context.Dr7 |=
+                        (1ULL << 16) |
+                        (DebugLengthEncoding(
+                             request->runtimeSize)
+                         << 18);
+
+                    context.Dr7 |=
+                        (1ULL << 20) |
+                        (DebugLengthEncoding(
+                             request->baseSize)
+                         << 22);
+                } else if (
+                    g_savedDebugRegisters.valid) {
+
+                    context.Dr0 =
+                        g_savedDebugRegisters.dr0;
+                    context.Dr1 =
+                        g_savedDebugRegisters.dr1;
+                    context.Dr2 =
+                        g_savedDebugRegisters.dr2;
+                    context.Dr3 =
+                        g_savedDebugRegisters.dr3;
+                    context.Dr6 =
+                        g_savedDebugRegisters.dr6;
+                    context.Dr7 =
+                        g_savedDebugRegisters.dr7;
+                }
+
+                ok =
+                    ::SetThreadContext(
+                        request->targetThread,
+                        &context) != FALSE;
+            }
+
+            ::ResumeThread(
+                request->targetThread);
+
+            request->ok = ok;
+            return 0;
+        }
+
+        bool ConfigureCurrentThreadDebugRegisters(
+            bool a_arm,
+            std::uintptr_t a_runtimeAddress = 0,
+            std::size_t a_runtimeSize = 0,
+            std::uintptr_t a_baseAddress = 0,
+            std::size_t a_baseSize = 0)
+        {
+            const auto threadId =
+                ::GetCurrentThreadId();
+
+            HANDLE thread =
+                ::OpenThread(
+                    THREAD_GET_CONTEXT |
+                        THREAD_SET_CONTEXT |
+                        THREAD_SUSPEND_RESUME |
+                        THREAD_QUERY_INFORMATION,
+                    FALSE,
+                    threadId);
+
+            if (!thread) {
+                return false;
+            }
+
+            DebugRegisterRequest request{};
+            request.targetThread = thread;
+            request.arm = a_arm;
+            request.runtimeAddress =
+                a_runtimeAddress;
+            request.runtimeSize =
+                a_runtimeSize;
+            request.baseAddress =
+                a_baseAddress;
+            request.baseSize =
+                a_baseSize;
+
+            HANDLE worker =
+                ::CreateThread(
+                    nullptr,
+                    0,
+                    DebugRegisterWorker,
+                    &request,
+                    0,
+                    nullptr);
+
+            if (!worker) {
+                ::CloseHandle(thread);
+                return false;
+            }
+
+            ::WaitForSingleObject(
+                worker,
+                INFINITE);
+
+            ::CloseHandle(worker);
+            ::CloseHandle(thread);
+
+            return request.ok;
+        }
+
+        bool ArmDeathFlagWriteWatch(
+            RE::Actor* a_actor)
+        {
+            if (!g_config.classifyDeathGateEffort ||
+                !a_actor) {
+                return false;
+            }
+
+            if (::IsDebuggerPresent()) {
+                logger::warn(
+                    "[effort-watch] debugger detected; hardware watch skipped to avoid clobbering debugger DR slots");
+                return false;
+            }
+
+            auto* base =
+                a_actor->GetActorBase();
+
+            if (!base) {
+                return false;
+            }
+
+            auto& runtime =
+                a_actor->GetActorRuntimeData();
+
+            constexpr auto runtimeSize =
+                sizeof(runtime.boolFlags);
+
+            constexpr auto baseSize =
+                sizeof(base->actorData.actorBaseFlags);
+
+            if ((runtimeSize != 1 &&
+                 runtimeSize != 2 &&
+                 runtimeSize != 4 &&
+                 runtimeSize != 8) ||
+                (baseSize != 1 &&
+                 baseSize != 2 &&
+                 baseSize != 4 &&
+                 baseSize != 8)) {
+
+                logger::warn(
+                    "[effort-watch] unsupported watch sizes runtime={} base={}",
+                    runtimeSize,
+                    baseSize);
+
+                return false;
+            }
+
+            g_runtimeFlagsWatchAddress =
+                reinterpret_cast<
+                    std::uintptr_t>(
+                        &runtime.boolFlags);
+
+            g_baseFlagsWatchAddress =
+                reinterpret_cast<
+                    std::uintptr_t>(
+                        &base->actorData
+                             .actorBaseFlags);
+
+            g_runtimeFlagsWatchSize =
+                runtimeSize;
+
+            g_baseFlagsWatchSize =
+                baseSize;
+
+            g_deathFlagWatchThreadId =
+                ::GetCurrentThreadId();
+
+            g_deathFlagWatchHitCount = 0;
+
+            for (auto& hit :
+                 g_deathFlagWatchHits) {
+                hit = {};
+            }
+
+            if (!g_deathFlagVEH) {
+                g_deathFlagVEH =
+                    ::AddVectoredExceptionHandler(
+                        1,
+                        DeathFlagVectoredHandler);
+            }
+
+            if (!g_deathFlagVEH) {
+                logger::warn(
+                    "[effort-watch] AddVectoredExceptionHandler failed");
+                return false;
+            }
+
+            const bool armed =
+                ConfigureCurrentThreadDebugRegisters(
+                    true,
+                    g_runtimeFlagsWatchAddress,
+                    g_runtimeFlagsWatchSize,
+                    g_baseFlagsWatchAddress,
+                    g_baseFlagsWatchSize);
+
+            if (!armed) {
+                logger::warn(
+                    "[effort-watch] could not arm hardware write watch");
+                return false;
+            }
+
+            ::InterlockedExchange(
+                &g_deathFlagWatchActive,
+                1);
+
+            logger::info(
+                "[effort-watch] ARMED tid={} runtimeFlags=0x{:X}/{}B baseFlags=0x{:X}/{}B",
+                g_deathFlagWatchThreadId,
+                g_runtimeFlagsWatchAddress,
+                g_runtimeFlagsWatchSize,
+                g_baseFlagsWatchAddress,
+                g_baseFlagsWatchSize);
+
+            return true;
+        }
+
+        void DisarmDeathFlagWriteWatch()
+        {
+            if (::InterlockedExchange(
+                    &g_deathFlagWatchActive,
+                    0) == 0) {
+                return;
+            }
+
+            const bool restored =
+                ConfigureCurrentThreadDebugRegisters(
+                    false);
+
+            logger::info(
+                "[effort-watch] DISARM restoredDebugRegisters={}",
+                restored);
+        }
+
+        struct EffortWatchSummary
+        {
+            std::size_t hits{};
+            std::size_t runtimeHits{};
+            std::size_t baseHits{};
+            std::vector<std::uintptr_t>
+                runtimeSites{};
+            std::vector<std::uintptr_t>
+                baseSites{};
+        };
+
+        void AddUniqueSite(
+            std::vector<std::uintptr_t>& a_sites,
+            std::uintptr_t a_rip)
+        {
+            if (std::find(
+                    a_sites.begin(),
+                    a_sites.end(),
+                    a_rip) ==
+                a_sites.end()) {
+                a_sites.push_back(
+                    a_rip);
+            }
+        }
+
+        EffortWatchSummary DumpDeathFlagWriteWatch()
+        {
+            EffortWatchSummary summary{};
+
+            const auto rawCount =
+                ::InterlockedCompareExchange(
+                    &g_deathFlagWatchHitCount,
+                    0,
+                    0);
+
+            const auto count =
+                std::min<std::size_t>(
+                    rawCount > 0 ?
+                        static_cast<std::size_t>(
+                            rawCount) :
+                        0,
+                    g_deathFlagWatchHits.size());
+
+            summary.hits = count;
+
+            for (std::size_t i = 0;
+                 i < count;
+                 ++i) {
+
+                const auto& hit =
+                    g_deathFlagWatchHits[i];
+
+                if ((hit.slotMask & 0x1u) != 0) {
+                    ++summary.runtimeHits;
+                    AddUniqueSite(
+                        summary.runtimeSites,
+                        hit.rip);
+                }
+
+                if ((hit.slotMask & 0x2u) != 0) {
+                    ++summary.baseHits;
+                    AddUniqueSite(
+                        summary.baseSites,
+                        hit.rip);
+                }
+
+                logger::info(
+                    "[effort-watch:{}] slots=0x{:X} rip={} runtimeRaw=0x{:X} baseRaw=0x{:X} tid={}",
+                    i + 1,
+                    hit.slotMask,
+                    FormatAddress(
+                        hit.rip),
+                    hit.runtimeFlagsRaw,
+                    hit.baseFlagsRaw,
+                    hit.threadId);
+            }
+
+            logger::info(
+                "[effort-watch] SUMMARY hits={} runtimeHits={} runtimeUniqueSites={} baseHits={} baseUniqueSites={}",
+                summary.hits,
+                summary.runtimeHits,
+                summary.runtimeSites.size(),
+                summary.baseHits,
+                summary.baseSites.size());
+
+            for (std::size_t i = 0;
+                 i < summary.runtimeSites.size();
+                 ++i) {
+
+                logger::info(
+                    "[effort-watch] runtimeSite[{}]={}",
+                    i,
+                    FormatAddress(
+                        summary.runtimeSites[i]));
+            }
+
+            for (std::size_t i = 0;
+                 i < summary.baseSites.size();
+                 ++i) {
+
+                logger::info(
+                    "[effort-watch] baseSite[{}]={}",
+                    i,
+                    FormatAddress(
+                        summary.baseSites[i]));
+            }
+
+            return summary;
+        }
+
+        void LogEffortClassification(
+            bool a_watchArmed,
+            const EffortWatchSummary& a_summary,
+            bool a_runtimeFlagsReappeared,
+            bool a_baseFlagsReappeared,
+            LONG64 a_killDyingDelta,
+            LONG64 a_resurrectDelta,
+            LONG64 a_deathEventDelta,
+            LONG64 a_bleedoutDelta)
+        {
+            if (!g_config.classifyDeathGateEffort) {
+                return;
+            }
+
+            std::string verdict;
+            std::string reason;
+
+            if (!a_watchArmed) {
+                verdict = "INCONCLUSIVE";
+                reason =
+                    "hardware write watch was unavailable";
+            } else if (
+                a_runtimeFlagsReappeared &&
+                a_summary.runtimeHits == 0) {
+
+                verdict = "INCONCLUSIVE";
+                reason =
+                    "runtime flags changed but no write breakpoint fired";
+            } else if (
+                a_summary.runtimeSites.size() <= 1 &&
+                a_summary.baseSites.empty() &&
+                a_killDyingDelta == 0 &&
+                a_resurrectDelta == 0 &&
+                a_deathEventDelta == 0 &&
+                a_bleedoutDelta <= 1) {
+
+                verdict = "CONCENTRATED_GATE_LIKELY";
+                reason =
+                    "runtime protection was rebuilt from one write site with no distributed lifecycle activity";
+            } else if (
+                a_summary.runtimeSites.size() >= 3 ||
+                a_summary.baseSites.size() >= 2 ||
+                a_resurrectDelta > 0 ||
+                (a_killDyingDelta > 0 &&
+                 a_bleedoutDelta > 0)) {
+
+                verdict = "MULTI_LAYER_LIKELY";
+                reason =
+                    "multiple write sites or multiple lifecycle transitions participated";
+            } else {
+                verdict = "MODERATE_OR_MIXED";
+                reason =
+                    "more than one mechanism participated, but the path is still bounded";
+            }
+
+            logger::info(
+                "[effort-classifier] verdict={} reason=\"{}\" runtimeReappeared={} baseReappeared={} runtimeUniqueSites={} baseUniqueSites={} killDyingDelta={} resurrectDelta={} deathEventDelta={} bleedoutDelta={}",
+                verdict,
+                reason,
+                a_runtimeFlagsReappeared,
+                a_baseFlagsReappeared,
+                a_summary.runtimeSites.size(),
+                a_summary.baseSites.size(),
+                a_killDyingDelta,
+                a_resurrectDelta,
+                a_deathEventDelta,
+                a_bleedoutDelta);
         }
 
         bool MarkKillAttemptOnce(
@@ -1587,6 +2256,10 @@ namespace UCA
                     atCall.baseEssential,
                     atCall.baseProtected);
 
+                const bool effortWatchArmed =
+                    ArmDeathFlagWriteWatch(
+                        actor);
+
                 logger::info(
                     "[one-pass:{}] CALL KillImpl attacker={} damage={} sendEvent=true ragdollInstant=false",
                     a_hitID,
@@ -1601,6 +2274,11 @@ namespace UCA
                     amount,
                     true,
                     false);
+
+                DisarmDeathFlagWriteWatch();
+
+                const auto effortSummary =
+                    DumpDeathFlagWriteWatch();
 
                 auto healthAfterKill =
                     g_vanillaGetActorValue ?
@@ -1691,6 +2369,22 @@ namespace UCA
                         0,
                         0);
 
+                const auto killDyingDelta =
+                    killDyingAfter -
+                    killDyingBefore;
+
+                const auto resurrectDelta =
+                    resurrectAfter -
+                    resurrectBefore;
+
+                const auto deathEventDelta =
+                    deathEventsAfter -
+                    deathEventsBefore;
+
+                const auto bleedoutDelta =
+                    bleedoutAfter -
+                    bleedoutBefore;
+
                 logger::info(
                     "[second-layer:{}] FINAL lifeState={} dyingOrDead={} runtimeE={} runtimeP={} baseE={} baseP={} killDyingVCallsDelta={} resurrectVCallsDelta={} deathEventsDelta={} bleedoutEventsDelta={}",
                     a_hitID,
@@ -1701,14 +2395,22 @@ namespace UCA
                     finalProtection.runtimeProtected,
                     finalProtection.baseEssential,
                     finalProtection.baseProtected,
-                    killDyingAfter -
-                        killDyingBefore,
-                    resurrectAfter -
-                        resurrectBefore,
-                    deathEventsAfter -
-                        deathEventsBefore,
-                    bleedoutAfter -
-                        bleedoutBefore);
+                    killDyingDelta,
+                    resurrectDelta,
+                    deathEventDelta,
+                    bleedoutDelta);
+
+                LogEffortClassification(
+                    effortWatchArmed,
+                    effortSummary,
+                    finalProtection.runtimeEssential ||
+                        finalProtection.runtimeProtected,
+                    finalProtection.baseEssential ||
+                        finalProtection.baseProtected,
+                    killDyingDelta,
+                    resurrectDelta,
+                    deathEventDelta,
+                    bleedoutDelta);
 
                 // If no real Dying/Dead transition occurred, restore both
                 // base and runtime protection layers.  If death did start,
@@ -2014,7 +2716,7 @@ namespace UCA
         SetupLog();
 
         logger::info(
-            "UniversalCombatArbiter FINAL Stop-Line Death Diagnostic loading; runtime {}",
+            "UniversalCombatArbiter FINAL One-Shot Effort Classifier loading; runtime {}",
             a_skse
                 ->RuntimeVersion()
                 .string());
@@ -2022,7 +2724,7 @@ namespace UCA
         LoadConfig();
 
         logger::info(
-            "[stop-line] Final diagnostic build: synchronous lifecycle stacks enabled");
+            "[effort-classifier] One-shot build: lifecycle stacks + hardware flag-write classification enabled");
 
         if (!g_pristine.Load()) {
             logger::critical(
