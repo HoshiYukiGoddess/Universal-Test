@@ -48,7 +48,7 @@ jobs:
           git clone --depth 1 https://github.com/microsoft/vcpkg.git C:\vcpkg
           & C:\vcpkg\bootstrap-vcpkg.bat -disableMetrics
 
-            - name: Configure
+      - name: Configure
         shell: pwsh
         run: |
           cmake -S . -B build `
