@@ -11,11 +11,13 @@ namespace UCA
     {
         constexpr std::size_t kAVO_GetActorValue = 0x01;
         constexpr std::size_t kAVO_ModActorValue = 0x05;
+        constexpr std::size_t kActor_KillImpl = 0x10E;
 
         struct Config
         {
             bool playerHasAbsoluteDamage{ true };
             bool logHealth{ true };
+            bool attemptVanillaKillImpl{ true };
             float directDamage{ 1000.0F };
             std::uint32_t cooldownMs{ 250 };
         };
@@ -114,6 +116,11 @@ namespace UCA
                     "bLogDirectHealth",
                     true);
 
+            g_config.attemptVanillaKillImpl =
+                ReadIniBool(
+                    "bAttemptVanillaKillImpl",
+                    true);
+
             g_config.directDamage =
                 std::max(
                     0.0F,
@@ -130,11 +137,12 @@ namespace UCA
                     5000u);
 
             logger::info(
-                "Final PoC config: player={}, damage={}, cooldown={}ms, logHealth={}",
+                "Death-Gate PoC config: player={}, damage={}, cooldown={}ms, logHealth={}, killImpl={}",
                 g_config.playerHasAbsoluteDamage,
                 g_config.directDamage,
                 g_config.cooldownMs,
-                g_config.logHealth);
+                g_config.logHealth,
+                g_config.attemptVanillaKillImpl);
         }
 
         struct AddressInfo
@@ -485,8 +493,17 @@ namespace UCA
                 RE::ActorValue,
                 float);
 
+        using KillImpl_t =
+            void (*)(
+                RE::Actor*,
+                RE::Actor*,
+                float,
+                bool,
+                bool);
+
         GetActorValue_t g_vanillaGetActorValue{};
         ModActorValue_t g_vanillaModActorValue{};
+        KillImpl_t g_vanillaKillImpl{};
 
         bool g_bypassReady{ false };
         bool g_hitSinkRegistered{ false };
@@ -495,6 +512,10 @@ namespace UCA
         std::unordered_map<
             RE::FormID,
             ULONGLONG> g_lastHitByTarget;
+
+        std::unordered_map<
+            RE::FormID,
+            bool> g_killAttemptedByTarget;
 
         bool ShouldQueueTarget(
             RE::FormID a_formID)
@@ -535,6 +556,62 @@ namespace UCA
                 now);
 
             return true;
+        }
+
+        std::uint32_t GetLifeStateRaw(
+            RE::Actor* a_actor)
+        {
+            if (!a_actor) {
+                return 0xFFFFFFFFu;
+            }
+
+            auto* state =
+                a_actor->AsActorState();
+
+            if (!state) {
+                return 0xFFFFFFFFu;
+            }
+
+            return static_cast<std::uint32_t>(
+                state->GetLifeState());
+        }
+
+        bool IsDyingOrDead(
+            RE::Actor* a_actor)
+        {
+            if (!a_actor) {
+                return true;
+            }
+
+            auto* state =
+                a_actor->AsActorState();
+
+            if (!state) {
+                return false;
+            }
+
+            const auto life =
+                state->GetLifeState();
+
+            return life ==
+                       RE::ACTOR_LIFE_STATE::kDying ||
+                   life ==
+                       RE::ACTOR_LIFE_STATE::kDead;
+        }
+
+        bool MarkKillAttemptOnce(
+            RE::FormID a_formID)
+        {
+            std::scoped_lock lock{
+                g_hitMutex
+            };
+
+            const auto [it, inserted] =
+                g_killAttemptedByTarget.emplace(
+                    a_formID,
+                    true);
+
+            return inserted;
         }
 
         std::uintptr_t
@@ -593,6 +670,27 @@ namespace UCA
                     liveAVOVT,
                     kAVO_ModActorValue);
 
+            static REL::Relocation<
+                std::uintptr_t>
+                actorVTable{
+                    RE::VTABLE_Actor[0]
+                };
+
+            const auto actorVT =
+                actorVTable.address();
+
+            const auto currentKillImpl =
+                *reinterpret_cast<
+                    const std::uintptr_t*>(
+                        actorVT +
+                        kActor_KillImpl *
+                            sizeof(void*));
+
+            const auto pristineKillImpl =
+                g_pristine.ResolveVFunc(
+                    actorVT,
+                    kActor_KillImpl);
+
             logger::info(
                 "[direct-av] live vtable=0x{:X}; current ModActorValue={}; pristine GetActorValue={}; pristine ModActorValue={}",
                 liveAVOVT,
@@ -611,8 +709,25 @@ namespace UCA
                         "<unavailable>"
                     });
 
+            logger::info(
+                "[death-gate] Actor vtable=0x{:X}; current KillImpl={}; pristine KillImpl={}; same={}",
+                actorVT,
+                FormatAddress(
+                    currentKillImpl),
+                pristineKillImpl ?
+                    FormatAddress(
+                        pristineKillImpl) :
+                    std::string{
+                        "<unavailable>"
+                    },
+                pristineKillImpl != 0 &&
+                    currentKillImpl ==
+                        pristineKillImpl);
+
             if (!pristineGet ||
-                !pristineMod) {
+                !pristineMod ||
+                (g_config.attemptVanillaKillImpl &&
+                 !pristineKillImpl)) {
 
                 logger::error(
                     "[direct-av] could not recover pristine ActorValueOwner functions");
@@ -629,10 +744,20 @@ namespace UCA
                     ModActorValue_t>(
                         pristineMod);
 
+            g_vanillaKillImpl =
+                reinterpret_cast<
+                    KillImpl_t>(
+                        pristineKillImpl);
+
             g_bypassReady = true;
 
             logger::info(
                 "[direct-av] universal direct-AV bypass ready");
+
+            if (g_config.attemptVanillaKillImpl) {
+                logger::info(
+                    "[death-gate] pristine KillImpl death transition probe ready");
+            }
 
             return true;
         }
@@ -717,30 +842,107 @@ namespace UCA
 
             std::optional<float> after;
 
-            if (g_config.logHealth &&
-                g_vanillaGetActorValue) {
-
+            if (g_vanillaGetActorValue) {
                 after =
                     g_vanillaGetActorValue(
                         avo,
                         RE::ActorValue::kHealth);
             }
 
+            const auto lifeAfterAV =
+                GetLifeStateRaw(
+                    actor);
+
             if (before &&
                 after) {
 
                 logger::info(
-                    "[direct-av:{}] RETURN target=0x{:08X} healthBefore={} healthAfter={} observedDelta={}",
+                    "[direct-av:{}] RETURN target=0x{:08X} healthBefore={} healthAfter={} observedDelta={} lifeState={}",
                     a_hitID,
                     a_targetForm,
                     *before,
                     *after,
-                    *after - *before);
+                    *after - *before,
+                    lifeAfterAV);
             } else {
                 logger::info(
-                    "[direct-av:{}] RETURN target=0x{:08X}",
+                    "[direct-av:{}] RETURN target=0x{:08X} lifeState={}",
                     a_hitID,
-                    a_targetForm);
+                    a_targetForm,
+                    lifeAfterAV);
+            }
+
+            // Death-gate experiment:
+            // For every Actor universally, if Bethesda's pristine AV write
+            // has made Health <= 0 but the Actor is still neither dying nor
+            // dead, call Bethesda's pristine Actor::KillImpl exactly once.
+            //
+            // No NPC name, FormID, plugin name or third-party RVA is used.
+            if (g_config.attemptVanillaKillImpl &&
+                g_vanillaKillImpl &&
+                after &&
+                *after <= 0.0F &&
+                !IsDyingOrDead(actor) &&
+                MarkKillAttemptOnce(
+                    a_targetForm)) {
+
+                auto* player =
+                    RE::PlayerCharacter::
+                        GetSingleton();
+
+                const auto lifeBeforeKill =
+                    GetLifeStateRaw(
+                        actor);
+
+                logger::info(
+                    "[death-gate:{}] CALL KillImpl target=0x{:08X} health={} lifeBefore={} attacker={} damage={} sendEvent=true ragdollInstant=false",
+                    a_hitID,
+                    a_targetForm,
+                    *after,
+                    lifeBeforeKill,
+                    player ?
+                        "player" :
+                        "null",
+                    amount);
+
+                g_vanillaKillImpl(
+                    actor,
+                    player,
+                    amount,
+                    true,
+                    false);
+
+                std::optional<float> healthAfterKill;
+
+                if (g_vanillaGetActorValue) {
+                    healthAfterKill =
+                        g_vanillaGetActorValue(
+                            avo,
+                            RE::ActorValue::kHealth);
+                }
+
+                const auto lifeAfterKill =
+                    GetLifeStateRaw(
+                        actor);
+
+                if (healthAfterKill) {
+                    logger::info(
+                        "[death-gate:{}] RETURN KillImpl target=0x{:08X} health={} lifeAfter={} dyingOrDead={}",
+                        a_hitID,
+                        a_targetForm,
+                        *healthAfterKill,
+                        lifeAfterKill,
+                        IsDyingOrDead(
+                            actor));
+                } else {
+                    logger::info(
+                        "[death-gate:{}] RETURN KillImpl target=0x{:08X} lifeAfter={} dyingOrDead={}",
+                        a_hitID,
+                        a_targetForm,
+                        lifeAfterKill,
+                        IsDyingOrDead(
+                            actor));
+                }
             }
 
             // One more observation on the next task turn.  This is useful
@@ -789,10 +991,14 @@ namespace UCA
                                     RE::ActorValue::kHealth);
 
                             logger::info(
-                                "[direct-av:{}] NEXT target=0x{:08X} health={}",
+                                "[direct-av:{}] NEXT target=0x{:08X} health={} lifeState={} dyingOrDead={}",
                                 a_hitID,
                                 a_targetForm,
-                                nextHealth);
+                                nextHealth,
+                                GetLifeStateRaw(
+                                    nextActor),
+                                IsDyingOrDead(
+                                    nextActor));
                         });
                 }
             }
@@ -1009,7 +1215,7 @@ namespace UCA
         SetupLog();
 
         logger::info(
-            "UniversalCombatArbiter FINAL PoC Direct-AV Bypass loading; runtime {}",
+            "UniversalCombatArbiter FINAL Death-Gate PoC loading; runtime {}",
             a_skse
                 ->RuntimeVersion()
                 .string());
