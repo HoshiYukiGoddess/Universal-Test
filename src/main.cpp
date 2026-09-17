@@ -247,6 +247,53 @@ namespace UCA
                 info.address);
         }
 
+        __declspec(noinline)
+        std::string CaptureStackSummary(
+            std::size_t a_maxFrames = 14)
+        {
+            constexpr std::size_t kMaxFrames = 20;
+
+            std::array<void*, kMaxFrames> frames{};
+
+            const auto requested =
+                static_cast<ULONG>(
+                    std::min<std::size_t>(
+                        a_maxFrames,
+                        kMaxFrames));
+
+            // Skip CaptureStackSummary itself.  Keeping the immediate
+            // event/wrapper frame is useful because the next frames show
+            // exactly who entered that lifecycle callback.
+            const auto captured =
+                ::CaptureStackBackTrace(
+                    1,
+                    requested,
+                    frames.data(),
+                    nullptr);
+
+            if (captured == 0) {
+                return "<unavailable>";
+            }
+
+            std::string out;
+
+            for (USHORT i = 0;
+                 i < captured;
+                 ++i) {
+
+                if (i != 0) {
+                    out += " <- ";
+                }
+
+                out += FormatAddress(
+                    reinterpret_cast<
+                        std::uintptr_t>(
+                            frames[i]));
+            }
+
+            return out;
+        }
+
         class PristineImage
         {
         public:
@@ -871,6 +918,11 @@ namespace UCA
                     reinterpret_cast<std::uintptr_t>(
                         _ReturnAddress())));
 
+            logger::info(
+                "[lifecycle-stack:{}] KillDying {}",
+                callNo,
+                CaptureStackSummary());
+
             if (g_prevKillDying) {
                 g_prevKillDying(
                     a_self);
@@ -917,6 +969,11 @@ namespace UCA
                 FormatAddress(
                     reinterpret_cast<std::uintptr_t>(
                         _ReturnAddress())));
+
+            logger::info(
+                "[lifecycle-stack:{}] Resurrect {}",
+                callNo,
+                CaptureStackSummary());
 
             if (g_prevResurrect) {
                 g_prevResurrect(
@@ -967,8 +1024,12 @@ namespace UCA
                         dying->As<RE::Actor>() :
                         nullptr;
 
+                const auto protection =
+                    ReadProtection(
+                        dyingActor);
+
                 logger::info(
-                    "[death-event:{}] dying=0x{:08X} killer=0x{:08X} dead={} lifeState={} tid={}",
+                    "[death-event:{}] dying=0x{:08X} killer=0x{:08X} dead={} lifeState={} runtimeE={} runtimeP={} baseE={} baseP={} tid={}",
                     eventNo,
                     dying ?
                         dying->GetFormID() :
@@ -979,7 +1040,16 @@ namespace UCA
                     a_event->dead,
                     GetLifeStateRaw(
                         dyingActor),
+                    protection.runtimeEssential,
+                    protection.runtimeProtected,
+                    protection.baseEssential,
+                    protection.baseProtected,
                     ::GetCurrentThreadId());
+
+                logger::info(
+                    "[death-stack:{}] {}",
+                    eventNo,
+                    CaptureStackSummary());
 
                 return RE::BSEventNotifyControl::
                     kContinue;
@@ -1015,15 +1085,28 @@ namespace UCA
                         actorRef->As<RE::Actor>() :
                         nullptr;
 
+                const auto protection =
+                    ReadProtection(
+                        actor);
+
                 logger::info(
-                    "[bleedout-event:{}] actor=0x{:08X} lifeState={} tid={}",
+                    "[bleedout-event:{}] actor=0x{:08X} lifeState={} runtimeE={} runtimeP={} baseE={} baseP={} tid={}",
                     eventNo,
                     actorRef ?
                         actorRef->GetFormID() :
                         0,
                     GetLifeStateRaw(
                         actor),
+                    protection.runtimeEssential,
+                    protection.runtimeProtected,
+                    protection.baseEssential,
+                    protection.baseProtected,
                     ::GetCurrentThreadId());
+
+                logger::info(
+                    "[bleedout-stack:{}] {}",
+                    eventNo,
+                    CaptureStackSummary());
 
                 return RE::BSEventNotifyControl::
                     kContinue;
@@ -1931,12 +2014,15 @@ namespace UCA
         SetupLog();
 
         logger::info(
-            "UniversalCombatArbiter FINAL One-Pass Death Bypass loading; runtime {}",
+            "UniversalCombatArbiter FINAL Stop-Line Death Diagnostic loading; runtime {}",
             a_skse
                 ->RuntimeVersion()
                 .string());
 
         LoadConfig();
+
+        logger::info(
+            "[stop-line] Final diagnostic build: synchronous lifecycle stacks enabled");
 
         if (!g_pristine.Load()) {
             logger::critical(
