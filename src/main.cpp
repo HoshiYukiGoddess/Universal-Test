@@ -15,6 +15,7 @@ namespace UCA
     {
         constexpr std::size_t kActor_HandleHealthDamage = 0x104;
         constexpr std::size_t kActor_CheckClampDamageModifier = 0x127;
+        constexpr std::size_t kAVO_ModActorValue = 0x05;
 
         struct Config
         {
@@ -64,7 +65,7 @@ namespace UCA
             g_config.traceEntryCalls = ReadIniBool("bTraceEntryCalls", true);
 
             logger::info(
-                "PoC3.1 config: hitEvents={}, vtableCalls={}, entryCalls={}",
+                "PoC3.2 config: hitEvents={}, vtableCalls={}, entryCalls={}",
                 g_config.traceHitEvents,
                 g_config.traceVTableCalls,
                 g_config.traceEntryCalls);
@@ -139,6 +140,56 @@ namespace UCA
                 info.moduleName,
                 info.address);
         }
+
+        __declspec(noinline)
+        std::string CaptureStackSummary(std::size_t a_depth = 10)
+        {
+            constexpr std::size_t kMaxFrames = 16;
+            std::array<void*, kMaxFrames> frames{};
+
+            const auto requested =
+                static_cast<ULONG>(
+                    std::min<std::size_t>(
+                        a_depth,
+                        kMaxFrames));
+
+            const auto captured =
+                ::CaptureStackBackTrace(
+                    2,
+                    requested,
+                    frames.data(),
+                    nullptr);
+
+            std::string out;
+
+            for (USHORT i = 0; i < captured; ++i) {
+                if (i != 0) {
+                    out += " <- ";
+                }
+
+                out += FormatAddress(
+                    reinterpret_cast<std::uintptr_t>(
+                        frames[i]));
+            }
+
+            if (out.empty()) {
+                out = "<unavailable>";
+            }
+
+            return out;
+        }
+
+        bool ShouldCaptureStack(
+            volatile LONG& a_counter,
+            LONG a_limit = 8)
+        {
+            return ::InterlockedIncrement(
+                       &a_counter) <= a_limit;
+        }
+
+        volatile LONG g_handleStackCount = 0;
+        volatile LONG g_clampStackCount = 0;
+        volatile LONG g_modAVStackCount = 0;
 
         std::string MemoryBytes(std::uintptr_t a_address, std::size_t a_count)
         {
@@ -383,6 +434,9 @@ namespace UCA
         using CheckClampDamageModifier_t =
             float (*)(RE::Actor*, RE::ActorValue, float);
 
+        using ModActorValue_t =
+            void (*)(RE::ActorValueOwner*, RE::ActorValue, float);
+
         struct VTableFunctions
         {
             HandleHealthDamage_t handleHealth{};
@@ -393,12 +447,14 @@ namespace UCA
         {
             HandleHealthDamage_t handleHealth{};
             CheckClampDamageModifier_t checkClamp{};
+            ModActorValue_t modAV{};
         };
 
         struct EngineTargets
         {
             std::uintptr_t handleHealth{};
             std::uintptr_t checkClamp{};
+            std::uintptr_t modAV{};
         };
 
         VTableFunctions g_vtablePrev{};
@@ -799,6 +855,9 @@ namespace UCA
                 return;
             }
 
+            const auto id =
+                NextTraceID();
+
             const auto caller =
                 reinterpret_cast<std::uintptr_t>(
                     _ReturnAddress());
@@ -810,7 +869,7 @@ namespace UCA
                 "attackerPtr=0x{:X} "
                 "attackerForm=0x{:08X} "
                 "input={} tid={} caller={}",
-                NextTraceID(),
+                id,
                 reinterpret_cast<std::uintptr_t>(
                     a_self),
                 a_self ?
@@ -824,6 +883,14 @@ namespace UCA
                 a_damage,
                 ::GetCurrentThreadId(),
                 FormatAddress(caller));
+
+            if (ShouldCaptureStack(
+                    g_handleStackCount)) {
+                logger::info(
+                    "[stack:{}] HandleHealthDamage {}",
+                    id,
+                    CaptureStackSummary());
+            }
 
             g_entryOriginal.handleHealth(
                 a_self,
@@ -870,6 +937,14 @@ namespace UCA
                 ::GetCurrentThreadId(),
                 FormatAddress(caller));
 
+            if (ShouldCaptureStack(
+                    g_clampStackCount)) {
+                logger::info(
+                    "[stack:{}] CheckClampDamageModifier {}",
+                    id,
+                    CaptureStackSummary());
+            }
+
             const auto result =
                 g_entryOriginal.checkClamp(
                     a_self,
@@ -886,6 +961,113 @@ namespace UCA
             return result;
         }
 
+
+
+        void E_ModActorValue(
+            RE::ActorValueOwner* a_self,
+            RE::ActorValue a_value,
+            float a_amount)
+        {
+            if (!g_entryOriginal.modAV) {
+                return;
+            }
+
+            if (a_value != RE::ActorValue::kHealth) {
+                g_entryOriginal.modAV(
+                    a_self,
+                    a_value,
+                    a_amount);
+                return;
+            }
+
+            const auto id =
+                NextTraceID();
+
+            const auto caller =
+                reinterpret_cast<std::uintptr_t>(
+                    _ReturnAddress());
+
+            logger::info(
+                "[av-entry:{}] ModActorValue(Health) "
+                "ownerPtr=0x{:X} amount={} tid={} caller={}",
+                id,
+                reinterpret_cast<std::uintptr_t>(
+                    a_self),
+                a_amount,
+                ::GetCurrentThreadId(),
+                FormatAddress(caller));
+
+            if (ShouldCaptureStack(
+                    g_modAVStackCount)) {
+                logger::info(
+                    "[stack:{}] ModActorValue(Health) {}",
+                    id,
+                    CaptureStackSummary());
+            }
+
+            g_entryOriginal.modAV(
+                a_self,
+                a_value,
+                a_amount);
+        }
+
+        std::uintptr_t DiscoverLiveActorAVOVTable()
+        {
+            auto* player =
+                RE::PlayerCharacter::GetSingleton();
+
+            auto* avo =
+                player ?
+                    player->AsActorValueOwner() :
+                    nullptr;
+
+            if (!player || !avo) {
+                return 0;
+            }
+
+            return *reinterpret_cast<
+                const std::uintptr_t*>(avo);
+        }
+
+        void InspectAndResolveAVOModTarget()
+        {
+            const auto liveAVOVT =
+                DiscoverLiveActorAVOVTable();
+
+            if (!liveAVOVT) {
+                logger::info(
+                    "[av-layout] live Actor::ActorValueOwner "
+                    "vtable unavailable; ModActorValue probe skipped");
+                return;
+            }
+
+            const auto current =
+                *reinterpret_cast<
+                    const std::uintptr_t*>(
+                        liveAVOVT +
+                        kAVO_ModActorValue *
+                            sizeof(void*));
+
+            const auto pristine =
+                g_pristine.ResolveVFunc(
+                    liveAVOVT,
+                    kAVO_ModActorValue);
+
+            logger::info(
+                "[av-layout] ModActorValue "
+                "liveVTable=0x{:X}[0x{:X}] "
+                "current={} pristine={} same={}",
+                liveAVOVT,
+                kAVO_ModActorValue,
+                FormatAddress(current),
+                pristine ?
+                    FormatAddress(pristine) :
+                    std::string{ "<unavailable>" },
+                pristine != 0 &&
+                    current == pristine);
+
+            g_targets.modAV = pristine;
+        }
         void InstallTracingOnce()
         {
             if (g_tracingInstalled) {
@@ -924,6 +1106,8 @@ namespace UCA
                     actorVT,
                     kActor_CheckClampDamageModifier);
 
+            InspectAndResolveAVOModTarget();
+
             InstallVTableHookOnce(
                 actorVT,
                 kActor_HandleHealthDamage,
@@ -950,10 +1134,16 @@ namespace UCA
                 E_CheckClampDamageModifier,
                 g_entryOriginal.checkClamp);
 
+            InstallFiveByteEntryHook(
+                "Skyrim::ActorValueOwner::ModActorValue",
+                g_targets.modAV,
+                E_ModActorValue,
+                g_entryOriginal.modAV);
+
             g_tracingInstalled = true;
 
             logger::info(
-                "PoC3.1 Safe Trace installed");
+                "PoC3.2 Stack + AV Probe installed");
         }
 
         void SetupLog()
@@ -1030,7 +1220,7 @@ namespace UCA
 
         logger::info(
             "UniversalCombatArbiter "
-            "PoC3.1 Safe Trace loading; runtime {}",
+            "PoC3.2 Stack + AV Probe loading; runtime {}",
             runtimeString);
 
         LoadConfig();
