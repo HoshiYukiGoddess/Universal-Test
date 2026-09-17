@@ -1,5 +1,10 @@
 #include "PCH.h"
 
+#include <fmt/format.h>
+#include <intrin.h>
+
+#pragma intrinsic(_ReturnAddress)
+
 namespace logger = SKSE::log;
 using namespace std::literals;
 
@@ -13,115 +18,235 @@ namespace UCA
         constexpr std::size_t kActor_KillImpl = 0x10E;
         constexpr std::size_t kActor_CheckClampDamageModifier = 0x127;
 
+        // ActorValueOwner virtual slots according to CommonLibSSE-NG.
+        constexpr std::size_t kAVO_GetActorValue = 0x01;
         constexpr std::size_t kAVO_SetBaseActorValue = 0x04;
-        constexpr std::size_t kAVO_ModBaseActorValue = 0x05;
-        constexpr std::size_t kAVO_ModActorValue = 0x06;
+        constexpr std::size_t kAVO_ModActorValue = 0x05;
+        constexpr std::size_t kAVO_RestoreActorValue = 0x06;
         constexpr std::size_t kAVO_SetActorValue = 0x07;
 
         struct Config
         {
-            bool playerHasAbsoluteDamage{ true };
-            bool terminalDeath{ true };
-            float terminalHoldSeconds{ 10.0F };
-            std::string attackerPlugin{};
-            std::uint32_t attackerLocalFormID{ 0 };
-            RE::TESNPC* attackerBase{ nullptr };
+            bool traceIntegrity{ true };
+            bool traceActorValueCalls{ true };
+            bool traceLifecycle{ true };
+            bool traceHealthReads{ false };
         };
 
         Config g_config;
 
         std::filesystem::path GetIniPath()
         {
-            return std::filesystem::path{ "Data" } / "SKSE" / "Plugins" / "UniversalCombatArbiter.ini";
+            return std::filesystem::path{ "Data" } /
+                   "SKSE" /
+                   "Plugins" /
+                   "UniversalCombatArbiter.ini";
         }
 
-        std::string ReadIniString(const char* a_key, const char* a_default = "")
+        std::string ReadIniString(
+            const char* a_key,
+            const char* a_default = "")
         {
             std::array<char, 512> buffer{};
+
             const auto path = GetIniPath().string();
-            ::GetPrivateProfileStringA("General", a_key, a_default, buffer.data(), static_cast<DWORD>(buffer.size()), path.c_str());
+
+            ::GetPrivateProfileStringA(
+                "General",
+                a_key,
+                a_default,
+                buffer.data(),
+                static_cast<DWORD>(buffer.size()),
+                path.c_str());
+
             return buffer.data();
         }
 
-        bool ReadIniBool(const char* a_key, bool a_default)
+        bool ReadIniBool(
+            const char* a_key,
+            bool a_default)
         {
-            const auto raw = ReadIniString(a_key, a_default ? "1" : "0");
-            return raw == "1" || raw == "true" || raw == "TRUE" || raw == "yes" || raw == "YES";
-        }
+            const auto raw =
+                ReadIniString(
+                    a_key,
+                    a_default ? "1" : "0");
 
-        float ReadIniFloat(const char* a_key, float a_default)
-        {
-            const auto raw = ReadIniString(a_key, "");
-            if (raw.empty()) {
-                return a_default;
-            }
-            try {
-                return std::stof(raw);
-            } catch (...) {
-                return a_default;
-            }
-        }
-
-        std::uint32_t ReadIniUInt(const char* a_key, std::uint32_t a_default)
-        {
-            const auto raw = ReadIniString(a_key, "");
-            if (raw.empty()) {
-                return a_default;
-            }
-            try {
-                std::size_t parsed = 0;
-                const auto value = std::stoul(raw, &parsed, 0);
-                return parsed ? static_cast<std::uint32_t>(value) : a_default;
-            } catch (...) {
-                return a_default;
-            }
+            return raw == "1" ||
+                   raw == "true" ||
+                   raw == "TRUE" ||
+                   raw == "yes" ||
+                   raw == "YES";
         }
 
         void LoadConfig()
         {
-            g_config.playerHasAbsoluteDamage = ReadIniBool("bPlayerHasAbsoluteDamage", true);
-            g_config.terminalDeath = ReadIniBool("bTerminalDeath", true);
-            g_config.terminalHoldSeconds = std::max(0.0F, ReadIniFloat("fTerminalHoldSeconds", 10.0F));
-            g_config.attackerPlugin = ReadIniString("sAttackerPlugin", "");
-            g_config.attackerLocalFormID = ReadIniUInt("iAttackerLocalFormID", 0);
+            g_config.traceIntegrity =
+                ReadIniBool(
+                    "bTraceIntegrity",
+                    true);
 
-            logger::info("Config: player={}, terminal={}, hold={}s, attackerPlugin='{}', localFormID=0x{:X}",
-                g_config.playerHasAbsoluteDamage,
-                g_config.terminalDeath,
-                g_config.terminalHoldSeconds,
-                g_config.attackerPlugin,
-                g_config.attackerLocalFormID);
+            g_config.traceActorValueCalls =
+                ReadIniBool(
+                    "bTraceActorValueCalls",
+                    true);
+
+            g_config.traceLifecycle =
+                ReadIniBool(
+                    "bTraceLifecycle",
+                    true);
+
+            g_config.traceHealthReads =
+                ReadIniBool(
+                    "bTraceHealthReads",
+                    false);
+
+            logger::info(
+                "Tracer config: integrity={}, "
+                "actorValue={}, lifecycle={}, "
+                "healthReads={}",
+                g_config.traceIntegrity,
+                g_config.traceActorValueCalls,
+                g_config.traceLifecycle,
+                g_config.traceHealthReads);
         }
 
-        void ResolveConfiguredAttacker()
+        std::uint64_t NextTraceID()
         {
-            g_config.attackerBase = nullptr;
-            if (g_config.attackerPlugin.empty() || g_config.attackerLocalFormID == 0) {
-                return;
-            }
+            static volatile LONG64 sequence = 0;
 
-            if (auto* data = RE::TESDataHandler::GetSingleton()) {
-                g_config.attackerBase = data->LookupForm<RE::TESNPC>(g_config.attackerLocalFormID, g_config.attackerPlugin);
-            }
-
-            if (g_config.attackerBase) {
-                logger::info("Configured attacker resolved: {} (0x{:08X})",
-                    g_config.attackerBase->GetName(),
-                    g_config.attackerBase->GetFormID());
-            } else {
-                logger::warn("Configured attacker could not be resolved");
-            }
+            return static_cast<std::uint64_t>(
+                ::InterlockedIncrement64(
+                    &sequence));
         }
 
-        bool IsAbsoluteAttacker(RE::Actor* a_attacker)
+        struct AddressInfo
         {
-            if (!a_attacker) {
-                return false;
+            std::uintptr_t address{};
+            std::uintptr_t moduleBase{};
+            std::uintptr_t offset{};
+
+            std::string moduleName{
+                "<non-module>"
+            };
+        };
+
+        AddressInfo DescribeAddress(
+            std::uintptr_t a_address)
+        {
+            AddressInfo result{};
+
+            result.address = a_address;
+
+            if (!a_address) {
+                result.moduleName = "<null>";
+                return result;
             }
-            if (g_config.playerHasAbsoluteDamage && a_attacker->IsPlayerRef()) {
-                return true;
+
+            MEMORY_BASIC_INFORMATION mbi{};
+
+            if (::VirtualQuery(
+                    reinterpret_cast<const void*>(
+                        a_address),
+                    &mbi,
+                    sizeof(mbi)) == 0 ||
+                !mbi.AllocationBase) {
+
+                return result;
             }
-            return g_config.attackerBase && a_attacker->GetActorBase() == g_config.attackerBase;
+
+            result.moduleBase =
+                reinterpret_cast<std::uintptr_t>(
+                    mbi.AllocationBase);
+
+            result.offset =
+                a_address -
+                result.moduleBase;
+
+            std::array<char, 32768> path{};
+
+            const auto count =
+                ::GetModuleFileNameA(
+                    reinterpret_cast<HMODULE>(
+                        mbi.AllocationBase),
+                    path.data(),
+                    static_cast<DWORD>(
+                        path.size()));
+
+            if (count > 0 &&
+                count < path.size()) {
+
+                result.moduleName =
+                    std::filesystem::path{
+                        path.data()
+                    }.filename().string();
+            }
+
+            return result;
+        }
+
+        std::string FormatAddress(
+            std::uintptr_t a_address)
+        {
+            const auto info =
+                DescribeAddress(
+                    a_address);
+
+            if (info.moduleBase) {
+                return fmt::format(
+                    "{}+0x{:X} [0x{:X}]",
+                    info.moduleName,
+                    info.offset,
+                    info.address);
+            }
+
+            return fmt::format(
+                "{} [0x{:X}]",
+                info.moduleName,
+                info.address);
+        }
+
+        std::string BytesToHex(
+            const std::byte* a_bytes,
+            std::size_t a_count)
+        {
+            static constexpr char kHex[] =
+                "0123456789ABCDEF";
+
+            std::string out{};
+
+            if (!a_bytes ||
+                a_count == 0) {
+
+                return out;
+            }
+
+            out.reserve(
+                a_count * 3);
+
+            for (std::size_t i = 0;
+                 i < a_count;
+                 ++i) {
+
+                const auto value =
+                    static_cast<unsigned char>(
+                        a_bytes[i]);
+
+                if (i != 0) {
+                    out.push_back(' ');
+                }
+
+                out.push_back(
+                    kHex[
+                        (value >> 4) &
+                        0x0F]);
+
+                out.push_back(
+                    kHex[
+                        value &
+                        0x0F]);
+            }
+
+            return out;
         }
 
         class PristineImage
@@ -129,502 +254,1885 @@ namespace UCA
         public:
             bool Load()
             {
-                const auto module = ::GetModuleHandleW(nullptr);
+                const auto module =
+                    ::GetModuleHandleW(
+                        nullptr);
+
                 if (!module) {
-                    logger::error("GetModuleHandleW(nullptr) failed");
+                    logger::error(
+                        "GetModuleHandleW(nullptr) failed");
                     return false;
                 }
-                _runtimeBase = reinterpret_cast<std::uintptr_t>(module);
+
+                _runtimeBase =
+                    reinterpret_cast<std::uintptr_t>(
+                        module);
 
                 std::array<wchar_t, 32768> path{};
-                const auto count = ::GetModuleFileNameW(module, path.data(), static_cast<DWORD>(path.size()));
-                if (count == 0 || count >= path.size()) {
-                    logger::error("GetModuleFileNameW failed");
+
+                const auto count =
+                    ::GetModuleFileNameW(
+                        module,
+                        path.data(),
+                        static_cast<DWORD>(
+                            path.size()));
+
+                if (count == 0 ||
+                    count >= path.size()) {
+
+                    logger::error(
+                        "GetModuleFileNameW failed");
                     return false;
                 }
 
-                std::ifstream input(std::filesystem::path{ path.data() }, std::ios::binary | std::ios::ate);
+                std::ifstream input(
+                    std::filesystem::path{
+                        path.data()
+                    },
+                    std::ios::binary |
+                        std::ios::ate);
+
                 if (!input) {
-                    logger::error("Could not open Skyrim executable on disk");
+                    logger::error(
+                        "Could not open Skyrim executable "
+                        "on disk");
                     return false;
                 }
-                const auto size = input.tellg();
+
+                const auto size =
+                    input.tellg();
+
                 if (size <= 0) {
                     return false;
                 }
-                _bytes.resize(static_cast<std::size_t>(size));
-                input.seekg(0, std::ios::beg);
-                input.read(reinterpret_cast<char*>(_bytes.data()), static_cast<std::streamsize>(size));
+
+                _bytes.resize(
+                    static_cast<std::size_t>(
+                        size));
+
+                input.seekg(
+                    0,
+                    std::ios::beg);
+
+                input.read(
+                    reinterpret_cast<char*>(
+                        _bytes.data()),
+                    static_cast<std::streamsize>(
+                        size));
+
                 if (!input) {
-                    logger::error("Could not read Skyrim executable");
+                    logger::error(
+                        "Could not read Skyrim executable");
                     return false;
                 }
 
-                if (_bytes.size() < sizeof(IMAGE_DOS_HEADER)) {
-                    return false;
-                }
-                const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(_bytes.data());
-                if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0) {
-                    return false;
-                }
-                if (static_cast<std::size_t>(dos->e_lfanew) + sizeof(IMAGE_NT_HEADERS64) > _bytes.size()) {
+                if (_bytes.size() <
+                    sizeof(
+                        IMAGE_DOS_HEADER)) {
+
                     return false;
                 }
 
-                const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(_bytes.data() + dos->e_lfanew);
-                if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+                const auto* dos =
+                    reinterpret_cast<
+                        const IMAGE_DOS_HEADER*>(
+                            _bytes.data());
+
+                if (dos->e_magic !=
+                        IMAGE_DOS_SIGNATURE ||
+                    dos->e_lfanew <= 0) {
+
                     return false;
                 }
 
-                _preferredBase = static_cast<std::uintptr_t>(nt->OptionalHeader.ImageBase);
-                _sizeOfImage = nt->OptionalHeader.SizeOfImage;
-                _sizeOfHeaders = nt->OptionalHeader.SizeOfHeaders;
+                if (static_cast<std::size_t>(
+                        dos->e_lfanew) +
+                        sizeof(
+                            IMAGE_NT_HEADERS64) >
+                    _bytes.size()) {
 
-                const auto* first = IMAGE_FIRST_SECTION(nt);
-                _sections.assign(first, first + nt->FileHeader.NumberOfSections);
+                    return false;
+                }
 
-                logger::info("Pristine executable loaded: runtimeBase=0x{:X}, preferredBase=0x{:X}, imageSize=0x{:X}",
-                    _runtimeBase, _preferredBase, _sizeOfImage);
+                const auto* nt =
+                    reinterpret_cast<
+                        const IMAGE_NT_HEADERS64*>(
+                            _bytes.data() +
+                            dos->e_lfanew);
+
+                if (nt->Signature !=
+                        IMAGE_NT_SIGNATURE ||
+                    nt->OptionalHeader.Magic !=
+                        IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+
+                    return false;
+                }
+
+                _preferredBase =
+                    static_cast<std::uintptr_t>(
+                        nt->OptionalHeader.ImageBase);
+
+                _sizeOfImage =
+                    nt->OptionalHeader.SizeOfImage;
+
+                _sizeOfHeaders =
+                    nt->OptionalHeader.SizeOfHeaders;
+
+                const auto* first =
+                    IMAGE_FIRST_SECTION(
+                        nt);
+
+                _sections.assign(
+                    first,
+                    first +
+                        nt->FileHeader
+                            .NumberOfSections);
+
+                logger::info(
+                    "Pristine executable loaded: "
+                    "runtimeBase=0x{:X}, "
+                    "preferredBase=0x{:X}, "
+                    "imageSize=0x{:X}",
+                    _runtimeBase,
+                    _preferredBase,
+                    _sizeOfImage);
+
                 return true;
             }
 
-            [[nodiscard]] std::uintptr_t ResolveVFunc(std::uintptr_t a_runtimeVTable, std::size_t a_slot) const
+            [[nodiscard]]
+            std::uintptr_t ResolveVFunc(
+                std::uintptr_t a_runtimeVTable,
+                std::size_t a_slot) const
             {
-                if (!_runtimeBase || _bytes.empty() || a_runtimeVTable < _runtimeBase) {
+                if (!_runtimeBase ||
+                    _bytes.empty() ||
+                    a_runtimeVTable <
+                        _runtimeBase) {
+
                     return 0;
                 }
 
-                const auto vtableRva = a_runtimeVTable - _runtimeBase;
-                const auto entryRva = vtableRva + (a_slot * sizeof(std::uintptr_t));
-                const auto fileOffset = RvaToFileOffset(entryRva);
-                if (!fileOffset || *fileOffset + sizeof(std::uint64_t) > _bytes.size()) {
+                const auto vtableRva =
+                    a_runtimeVTable -
+                    _runtimeBase;
+
+                const auto entryRva =
+                    vtableRva +
+                    (a_slot *
+                     sizeof(
+                         std::uintptr_t));
+
+                const auto fileOffset =
+                    RvaToFileOffset(
+                        entryRva);
+
+                if (!fileOffset ||
+                    *fileOffset +
+                        sizeof(
+                            std::uint64_t) >
+                        _bytes.size()) {
+
                     return 0;
                 }
 
                 std::uint64_t preferredVA = 0;
-                std::memcpy(&preferredVA, _bytes.data() + *fileOffset, sizeof(preferredVA));
-                if (preferredVA < _preferredBase || preferredVA >= (_preferredBase + _sizeOfImage)) {
+
+                std::memcpy(
+                    &preferredVA,
+                    _bytes.data() +
+                        *fileOffset,
+                    sizeof(
+                        preferredVA));
+
+                if (preferredVA <
+                        _preferredBase ||
+                    preferredVA >=
+                        (_preferredBase +
+                         _sizeOfImage)) {
+
                     return 0;
                 }
 
-                return _runtimeBase + static_cast<std::uintptr_t>(preferredVA - _preferredBase);
+                return _runtimeBase +
+                       static_cast<
+                           std::uintptr_t>(
+                               preferredVA -
+                               _preferredBase);
+            }
+
+            [[nodiscard]]
+            bool ReadRuntimeBytes(
+                std::uintptr_t a_runtimeAddress,
+                std::size_t a_count,
+                std::vector<std::byte>&
+                    a_out) const
+            {
+                a_out.clear();
+
+                if (!_runtimeBase ||
+                    !_sizeOfImage ||
+                    a_runtimeAddress <
+                        _runtimeBase) {
+
+                    return false;
+                }
+
+                const auto rva =
+                    a_runtimeAddress -
+                    _runtimeBase;
+
+                if (rva >=
+                    _sizeOfImage) {
+
+                    return false;
+                }
+
+                const auto fileOffset =
+                    RvaToFileOffset(
+                        rva);
+
+                if (!fileOffset ||
+                    *fileOffset +
+                            a_count >
+                        _bytes.size()) {
+
+                    return false;
+                }
+
+                a_out.resize(
+                    a_count);
+
+                std::memcpy(
+                    a_out.data(),
+                    _bytes.data() +
+                        *fileOffset,
+                    a_count);
+
+                return true;
             }
 
         private:
-            [[nodiscard]] std::optional<std::size_t> RvaToFileOffset(std::uintptr_t a_rva) const
+            [[nodiscard]]
+            std::optional<std::size_t>
+            RvaToFileOffset(
+                std::uintptr_t a_rva) const
             {
-                if (a_rva < _sizeOfHeaders) {
-                    return static_cast<std::size_t>(a_rva);
+                if (a_rva <
+                    _sizeOfHeaders) {
+
+                    return static_cast<
+                        std::size_t>(
+                            a_rva);
                 }
-                for (const auto& section : _sections) {
-                    const auto begin = static_cast<std::uintptr_t>(section.VirtualAddress);
-                    const auto span = static_cast<std::uintptr_t>(std::max(section.Misc.VirtualSize, section.SizeOfRawData));
-                    if (a_rva >= begin && a_rva < begin + span) {
-                        const auto delta = a_rva - begin;
-                        if (delta >= section.SizeOfRawData) {
+
+                for (const auto& section :
+                     _sections) {
+
+                    const auto begin =
+                        static_cast<
+                            std::uintptr_t>(
+                                section
+                                    .VirtualAddress);
+
+                    const auto span =
+                        static_cast<
+                            std::uintptr_t>(
+                                std::max(
+                                    section
+                                        .Misc
+                                        .VirtualSize,
+                                    section
+                                        .SizeOfRawData));
+
+                    if (a_rva >= begin &&
+                        a_rva <
+                            begin + span) {
+
+                        const auto delta =
+                            a_rva - begin;
+
+                        if (delta >=
+                            section
+                                .SizeOfRawData) {
+
                             return std::nullopt;
                         }
-                        return static_cast<std::size_t>(section.PointerToRawData + delta);
+
+                        return static_cast<
+                            std::size_t>(
+                                section
+                                    .PointerToRawData +
+                                delta);
                     }
                 }
+
                 return std::nullopt;
             }
 
-            std::vector<std::byte> _bytes{};
-            std::vector<IMAGE_SECTION_HEADER> _sections{};
-            std::uintptr_t _runtimeBase{ 0 };
-            std::uintptr_t _preferredBase{ 0 };
-            std::uintptr_t _sizeOfImage{ 0 };
-            std::uintptr_t _sizeOfHeaders{ 0 };
+            std::vector<std::byte>
+                _bytes{};
+
+            std::vector<
+                IMAGE_SECTION_HEADER>
+                _sections{};
+
+            std::uintptr_t
+                _runtimeBase{};
+
+            std::uintptr_t
+                _preferredBase{};
+
+            std::uintptr_t
+                _sizeOfImage{};
+
+            std::uintptr_t
+                _sizeOfHeaders{};
         };
 
         PristineImage g_pristine;
 
-        using HandleHealthDamage_t = void (*)(RE::Actor*, RE::Actor*, float);
-        using KillImpl_t = void (*)(RE::Actor*, RE::Actor*, float, bool, bool);
-        using CheckClampDamageModifier_t = float (*)(RE::Actor*, RE::ActorValue, float);
-        using KillDying_t = void (*)(RE::Actor*);
-        using Resurrect_t = void (*)(RE::Actor*, bool, bool);
+        using HandleHealthDamage_t =
+            void (*)(
+                RE::Actor*,
+                RE::Actor*,
+                float);
 
-        using SetBaseActorValue_t = void (*)(RE::ActorValueOwner*, RE::ActorValue, float);
-        using ModBaseActorValue_t = void (*)(RE::ActorValueOwner*, RE::ActorValue, float);
-        using ModActorValue_t = void (*)(RE::ActorValueOwner*, RE::ACTOR_VALUE_MODIFIER, RE::ActorValue, float);
-        using SetActorValue_t = void (*)(RE::ActorValueOwner*, RE::ActorValue, float);
+        using KillImpl_t =
+            void (*)(
+                RE::Actor*,
+                RE::Actor*,
+                float,
+                bool,
+                bool);
+
+        using CheckClampDamageModifier_t =
+            float (*)(
+                RE::Actor*,
+                RE::ActorValue,
+                float);
+
+        using KillDying_t =
+            void (*)(
+                RE::Actor*);
+
+        using Resurrect_t =
+            void (*)(
+                RE::Actor*,
+                bool,
+                bool);
+
+        using GetActorValue_t =
+            float (*)(
+                RE::ActorValueOwner*,
+                RE::ActorValue);
+
+        using SetBaseActorValue_t =
+            void (*)(
+                RE::ActorValueOwner*,
+                RE::ActorValue,
+                float);
+
+        using ModActorValue_t =
+            void (*)(
+                RE::ActorValueOwner*,
+                RE::ActorValue,
+                float);
+
+        using RestoreActorValue_t =
+            void (*)(
+                RE::ActorValueOwner*,
+                RE::ACTOR_VALUE_MODIFIER,
+                RE::ActorValue,
+                float);
+
+        using SetActorValue_t =
+            void (*)(
+                RE::ActorValueOwner*,
+                RE::ActorValue,
+                float);
 
         struct FunctionSet
         {
-            HandleHealthDamage_t prevHandleHealth{};
-            HandleHealthDamage_t vanillaHandleHealth{};
-            KillImpl_t prevKillImpl{};
-            KillImpl_t vanillaKillImpl{};
-            CheckClampDamageModifier_t prevCheckClamp{};
-            CheckClampDamageModifier_t vanillaCheckClamp{};
-            KillDying_t prevKillDying{};
-            KillDying_t vanillaKillDying{};
-            Resurrect_t prevResurrect{};
-            Resurrect_t vanillaResurrect{};
+            HandleHealthDamage_t
+                prevHandleHealth{};
 
-            SetBaseActorValue_t prevSetBase{};
-            SetBaseActorValue_t vanillaSetBase{};
-            ModBaseActorValue_t prevModBase{};
-            ModBaseActorValue_t vanillaModBase{};
-            ModActorValue_t prevModAV{};
-            ModActorValue_t vanillaModAV{};
-            SetActorValue_t prevSetAV{};
-            SetActorValue_t vanillaSetAV{};
+            KillImpl_t
+                prevKillImpl{};
+
+            CheckClampDamageModifier_t
+                prevCheckClamp{};
+
+            KillDying_t
+                prevKillDying{};
+
+            Resurrect_t
+                prevResurrect{};
+
+            GetActorValue_t
+                prevGetAV{};
+
+            SetBaseActorValue_t
+                prevSetBase{};
+
+            ModActorValue_t
+                prevModAV{};
+
+            RestoreActorValue_t
+                prevRestoreAV{};
+
+            SetActorValue_t
+                prevSetAV{};
         };
 
         FunctionSet g_fn;
 
-        struct AbsoluteContext
-        {
-            RE::Actor* target{};
-            RE::ActorValueOwner* targetAVO{};
-            std::uint32_t depth{};
-        };
+        std::uintptr_t
+            g_liveActorAVOVTable{};
 
-        thread_local AbsoluteContext g_ctx{};
+        std::intptr_t
+            g_actorToAVOOffset{};
 
-        class ScopedAbsoluteContext
+        RE::Actor* ActorFromAVO(
+            RE::ActorValueOwner* a_owner)
         {
-        public:
-            explicit ScopedAbsoluteContext(RE::Actor* a_target)
-            {
-                if (g_ctx.depth++ == 0) {
-                    g_ctx.target = a_target;
-                    g_ctx.targetAVO = a_target ? a_target->AsActorValueOwner() : nullptr;
-                    _owner = true;
-                }
+            if (!a_owner) {
+                return nullptr;
             }
 
-            ~ScopedAbsoluteContext()
-            {
-                if (g_ctx.depth > 0 && --g_ctx.depth == 0) {
-                    g_ctx.target = nullptr;
-                    g_ctx.targetAVO = nullptr;
-                }
-            }
-
-            ScopedAbsoluteContext(const ScopedAbsoluteContext&) = delete;
-            ScopedAbsoluteContext& operator=(const ScopedAbsoluteContext&) = delete;
-
-        private:
-            bool _owner{ false };
-        };
-
-        struct TerminalEntry
-        {
-            RE::ActorValueOwner* avo{};
-            std::chrono::steady_clock::time_point until{};
-        };
-
-        std::mutex g_terminalLock;
-        std::unordered_map<RE::Actor*, TerminalEntry> g_terminalActors;
-        std::unordered_map<RE::ActorValueOwner*, std::chrono::steady_clock::time_point> g_terminalAVOs;
-
-        bool IsExpired(const std::chrono::steady_clock::time_point& a_until)
-        {
-            return std::chrono::steady_clock::now() >= a_until;
+            return reinterpret_cast<RE::Actor*>(
+                reinterpret_cast<
+                    std::uintptr_t>(
+                        a_owner) -
+                static_cast<
+                    std::uintptr_t>(
+                        g_actorToAVOOffset));
         }
 
-        void MarkTerminal(RE::Actor* a_actor)
+        std::uint32_t ActorFormIDFromAVO(
+            RE::ActorValueOwner* a_owner)
         {
-            if (!g_config.terminalDeath || !a_actor || g_config.terminalHoldSeconds <= 0.0F) {
-                return;
-            }
-            const auto millis = static_cast<std::int64_t>(g_config.terminalHoldSeconds * 1000.0F);
-            const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(millis);
-            auto* avo = a_actor->AsActorValueOwner();
+            const auto* actor =
+                ActorFromAVO(
+                    a_owner);
 
-            std::scoped_lock lock(g_terminalLock);
-            g_terminalActors[a_actor] = TerminalEntry{ avo, until };
-            if (avo) {
-                g_terminalAVOs[avo] = until;
-            }
-            logger::info("Terminal mark applied to 0x{:08X} for {}s", a_actor->GetFormID(), g_config.terminalHoldSeconds);
+            return actor ?
+                actor->GetFormID() :
+                0;
         }
 
-        bool IsTerminal(RE::Actor* a_actor)
+        float ReadHealth(
+            RE::ActorValueOwner* a_owner)
         {
-            if (!a_actor) {
-                return false;
+            if (!a_owner) {
+                return 0.0F;
             }
-            std::scoped_lock lock(g_terminalLock);
-            const auto it = g_terminalActors.find(a_actor);
-            if (it == g_terminalActors.end()) {
-                return false;
+
+            if (g_fn.prevGetAV) {
+                return g_fn.prevGetAV(
+                    a_owner,
+                    RE::ActorValue::kHealth);
             }
-            if (IsExpired(it->second.until)) {
-                if (it->second.avo) {
-                    g_terminalAVOs.erase(it->second.avo);
-                }
-                g_terminalActors.erase(it);
-                return false;
-            }
-            return true;
+
+            return a_owner->GetActorValue(
+                RE::ActorValue::kHealth);
         }
 
-        bool IsTerminal(RE::ActorValueOwner* a_avo)
+        float ReadHealth(
+            RE::Actor* a_actor)
         {
-            if (!a_avo) {
-                return false;
-            }
-            std::scoped_lock lock(g_terminalLock);
-            const auto it = g_terminalAVOs.find(a_avo);
-            if (it == g_terminalAVOs.end()) {
-                return false;
-            }
-            if (IsExpired(it->second)) {
-                g_terminalAVOs.erase(it);
-                return false;
-            }
-            return true;
+            return a_actor ?
+                ReadHealth(
+                    a_actor
+                        ->AsActorValueOwner()) :
+                0.0F;
         }
 
-        bool IsAbsoluteTarget(RE::Actor* a_actor)
+        void InspectEntryBytes(
+            std::string_view a_label,
+            std::uintptr_t a_function)
         {
-            return g_ctx.depth > 0 && g_ctx.target == a_actor;
-        }
+            if (!g_config.traceIntegrity ||
+                !a_function) {
 
-        bool IsAbsoluteTarget(RE::ActorValueOwner* a_avo)
-        {
-            return g_ctx.depth > 0 && g_ctx.targetAVO == a_avo;
-        }
-
-        void Hook_HandleHealthDamage(RE::Actor* a_self, RE::Actor* a_attacker, float a_damage)
-        {
-            if (!a_self || !g_fn.prevHandleHealth || !g_fn.vanillaHandleHealth) {
                 return;
             }
 
-            if (!IsAbsoluteAttacker(a_attacker)) {
-                g_fn.prevHandleHealth(a_self, a_attacker, a_damage);
+            constexpr std::size_t
+                kBytes = 16;
+
+            std::vector<std::byte>
+                disk{};
+
+            if (!g_pristine.ReadRuntimeBytes(
+                    a_function,
+                    kBytes,
+                    disk)) {
+
+                logger::info(
+                    "[integrity] {} "
+                    "target={} "
+                    "diskBytes=<unavailable>",
+                    a_label,
+                    FormatAddress(
+                        a_function));
+
                 return;
             }
 
-            logger::debug("Absolute damage: attacker=0x{:08X}, target=0x{:08X}, input={}",
-                a_attacker ? a_attacker->GetFormID() : 0,
-                a_self->GetFormID(),
+            std::array<
+                std::byte,
+                kBytes>
+                memory{};
+
+            std::memcpy(
+                memory.data(),
+                reinterpret_cast<
+                    const void*>(
+                        a_function),
+                memory.size());
+
+            const bool same =
+                std::memcmp(
+                    memory.data(),
+                    disk.data(),
+                    kBytes) == 0;
+
+            logger::info(
+                "[integrity] {} "
+                "target={} "
+                "bytesEqual={} "
+                "memory=[{}] "
+                "disk=[{}]",
+                a_label,
+                FormatAddress(
+                    a_function),
+                same,
+                BytesToHex(
+                    memory.data(),
+                    memory.size()),
+                BytesToHex(
+                    disk.data(),
+                    disk.size()));
+        }
+
+        void DescribeVTableSlot(
+            std::string_view a_label,
+            std::uintptr_t a_vtable,
+            std::size_t a_slot)
+        {
+            if (!a_vtable) {
+                logger::warn(
+                    "[slot] {} "
+                    "vtable=<null>",
+                    a_label);
+                return;
+            }
+
+            const auto current =
+                *reinterpret_cast<
+                    const std::uintptr_t*>(
+                        a_vtable +
+                        a_slot *
+                            sizeof(void*));
+
+            const auto pristine =
+                g_pristine.ResolveVFunc(
+                    a_vtable,
+                    a_slot);
+
+            logger::info(
+                "[slot] {} "
+                "vtable=0x{:X}[0x{:X}] "
+                "current={} "
+                "pristine={} "
+                "same={}",
+                a_label,
+                a_vtable,
+                a_slot,
+                FormatAddress(
+                    current),
+                pristine ?
+                    FormatAddress(
+                        pristine) :
+                    std::string{
+                        "<unavailable>"
+                    },
+                pristine != 0 &&
+                    current == pristine);
+        }
+
+        void InspectPristineSlot(
+            std::string_view a_label,
+            std::uintptr_t a_vtable,
+            std::size_t a_slot)
+        {
+            if (!a_vtable ||
+                !g_config.traceIntegrity) {
+
+                return;
+            }
+
+            const auto pristine =
+                g_pristine.ResolveVFunc(
+                    a_vtable,
+                    a_slot);
+
+            if (pristine) {
+                InspectEntryBytes(
+                    a_label,
+                    pristine);
+            }
+        }
+
+        template <class Fn>
+        Fn WriteVFuncRaw(
+            std::uintptr_t a_vtable,
+            std::size_t a_slot,
+            Fn a_hook)
+        {
+            if (!a_vtable ||
+                !a_hook) {
+
+                return nullptr;
+            }
+
+            auto* entry =
+                reinterpret_cast<
+                    std::uintptr_t*>(
+                        a_vtable +
+                        a_slot *
+                            sizeof(void*));
+
+            DWORD oldProtect = 0;
+
+            if (!::VirtualProtect(
+                    entry,
+                    sizeof(*entry),
+                    PAGE_READWRITE,
+                    &oldProtect)) {
+
+                logger::error(
+                    "VirtualProtect failed "
+                    "for vtable=0x{:X}[0x{:X}]",
+                    a_vtable,
+                    a_slot);
+
+                return nullptr;
+            }
+
+            const auto previous =
+                *entry;
+
+            *entry =
+                reinterpret_cast<
+                    std::uintptr_t>(
+                        a_hook);
+
+            DWORD ignored = 0;
+
+            ::VirtualProtect(
+                entry,
+                sizeof(*entry),
+                oldProtect,
+                &ignored);
+
+            return reinterpret_cast<Fn>(
+                previous);
+        }
+
+        template <class Fn>
+        void EnsureHook(
+            std::uintptr_t a_vtable,
+            std::size_t a_slot,
+            Fn a_hook,
+            Fn& a_previous,
+            std::string_view a_label)
+        {
+            if (!a_vtable) {
+                return;
+            }
+
+            const auto hookAddress =
+                reinterpret_cast<
+                    std::uintptr_t>(
+                        a_hook);
+
+            const auto currentAddress =
+                *reinterpret_cast<
+                    std::uintptr_t*>(
+                        a_vtable +
+                        a_slot *
+                            sizeof(void*));
+
+            if (currentAddress ==
+                hookAddress) {
+
+                return;
+            }
+
+            a_previous =
+                WriteVFuncRaw(
+                    a_vtable,
+                    a_slot,
+                    a_hook);
+
+            logger::info(
+                "[hook] {} "
+                "vtable=0x{:X}[0x{:X}] "
+                "prev={} ours={}",
+                a_label,
+                a_vtable,
+                a_slot,
+                FormatAddress(
+                    reinterpret_cast<
+                        std::uintptr_t>(
+                            a_previous)),
+                FormatAddress(
+                    hookAddress));
+        }
+
+        void Hook_HandleHealthDamage(
+            RE::Actor* a_self,
+            RE::Actor* a_attacker,
+            float a_damage)
+        {
+            if (!g_fn.prevHandleHealth) {
+                return;
+            }
+
+            const auto id =
+                NextTraceID();
+
+            const auto caller =
+                reinterpret_cast<
+                    std::uintptr_t>(
+                        _ReturnAddress());
+
+            const auto before =
+                ReadHealth(
+                    a_self);
+
+            logger::info(
+                "[trace:{}] ENTER "
+                "HandleHealthDamage "
+                "self=0x{:08X} "
+                "attacker=0x{:08X} "
+                "input={} "
+                "healthBefore={} "
+                "tid={} caller={}",
+                id,
+                a_self ?
+                    a_self->GetFormID() :
+                    0,
+                a_attacker ?
+                    a_attacker->GetFormID() :
+                    0,
+                a_damage,
+                before,
+                ::GetCurrentThreadId(),
+                FormatAddress(
+                    caller));
+
+            g_fn.prevHandleHealth(
+                a_self,
+                a_attacker,
                 a_damage);
 
-            {
-                ScopedAbsoluteContext absolute{ a_self };
-                g_fn.vanillaHandleHealth(a_self, a_attacker, a_damage);
-            }
+            const auto after =
+                ReadHealth(
+                    a_self);
 
-            const auto health = a_self->GetActorValue(RE::ActorValue::kHealth);
-            if (health <= 0.0F || a_self->IsDead()) {
-                MarkTerminal(a_self);
-            }
+            logger::info(
+                "[trace:{}] EXIT  "
+                "HandleHealthDamage "
+                "self=0x{:08X} "
+                "healthAfter={} "
+                "observedDelta={} "
+                "dead={}",
+                id,
+                a_self ?
+                    a_self->GetFormID() :
+                    0,
+                after,
+                after - before,
+                a_self ?
+                    a_self->IsDead() :
+                    false);
         }
 
-        float Hook_CheckClampDamageModifier(RE::Actor* a_self, RE::ActorValue a_value, float a_delta)
+        float Hook_CheckClampDamageModifier(
+            RE::Actor* a_self,
+            RE::ActorValue a_value,
+            float a_delta)
         {
-            const auto fn = IsAbsoluteTarget(a_self) ? g_fn.vanillaCheckClamp : g_fn.prevCheckClamp;
-            return fn ? fn(a_self, a_value, a_delta) : a_delta;
+            if (!g_fn.prevCheckClamp) {
+                return a_delta;
+            }
+
+            if (a_value !=
+                    RE::ActorValue::kHealth ||
+                !g_config
+                    .traceActorValueCalls) {
+
+                return g_fn.prevCheckClamp(
+                    a_self,
+                    a_value,
+                    a_delta);
+            }
+
+            const auto id =
+                NextTraceID();
+
+            const auto caller =
+                reinterpret_cast<
+                    std::uintptr_t>(
+                        _ReturnAddress());
+
+            const auto before =
+                ReadHealth(
+                    a_self);
+
+            const auto result =
+                g_fn.prevCheckClamp(
+                    a_self,
+                    a_value,
+                    a_delta);
+
+            const auto after =
+                ReadHealth(
+                    a_self);
+
+            logger::info(
+                "[trace:{}] "
+                "CheckClampDamageModifier "
+                "self=0x{:08X} "
+                "input={} result={} "
+                "healthBefore={} "
+                "healthAfter={} "
+                "tid={} caller={}",
+                id,
+                a_self ?
+                    a_self->GetFormID() :
+                    0,
+                a_delta,
+                result,
+                before,
+                after,
+                ::GetCurrentThreadId(),
+                FormatAddress(
+                    caller));
+
+            return result;
         }
 
-        void Hook_KillImpl(RE::Actor* a_self, RE::Actor* a_attacker, float a_damage, bool a_sendEvent, bool a_ragdollInstant)
+        void Hook_KillImpl(
+            RE::Actor* a_self,
+            RE::Actor* a_attacker,
+            float a_damage,
+            bool a_sendEvent,
+            bool a_ragdollInstant)
         {
-            const bool absolute = IsAbsoluteTarget(a_self);
-            const auto fn = absolute ? g_fn.vanillaKillImpl : g_fn.prevKillImpl;
-            if (fn) {
-                fn(a_self, a_attacker, a_damage, a_sendEvent, a_ragdollInstant);
-            }
-            if (absolute) {
-                MarkTerminal(a_self);
-            }
-        }
-
-        void Hook_KillDying(RE::Actor* a_self)
-        {
-            const auto fn = IsAbsoluteTarget(a_self) ? g_fn.vanillaKillDying : g_fn.prevKillDying;
-            if (fn) {
-                fn(a_self);
-            }
-        }
-
-        void Hook_Resurrect(RE::Actor* a_self, bool a_resetInventory, bool a_attach3D)
-        {
-            if (IsTerminal(a_self)) {
-                logger::debug("Terminal death blocked Resurrect on 0x{:08X}", a_self ? a_self->GetFormID() : 0);
+            if (!g_fn.prevKillImpl) {
                 return;
             }
-            if (g_fn.prevResurrect) {
-                g_fn.prevResurrect(a_self, a_resetInventory, a_attach3D);
-            }
-        }
 
-        void Hook_SetBaseActorValue(RE::ActorValueOwner* a_self, RE::ActorValue a_value, float a_amount)
-        {
-            const auto fn = IsAbsoluteTarget(a_self) ? g_fn.vanillaSetBase : g_fn.prevSetBase;
-            if (fn) {
-                fn(a_self, a_value, a_amount);
-            }
-        }
-
-        void Hook_ModBaseActorValue(RE::ActorValueOwner* a_self, RE::ActorValue a_value, float a_amount)
-        {
-            const auto fn = IsAbsoluteTarget(a_self) ? g_fn.vanillaModBase : g_fn.prevModBase;
-            if (fn) {
-                fn(a_self, a_value, a_amount);
-            }
-        }
-
-        void Hook_ModActorValue(RE::ActorValueOwner* a_self, RE::ACTOR_VALUE_MODIFIER a_modifier, RE::ActorValue a_value, float a_amount)
-        {
-            if (a_value == RE::ActorValue::kHealth && IsTerminal(a_self) && a_amount > 0.0F) {
-                logger::debug("Terminal death blocked positive Health ModActorValue ({})", a_amount);
+            if (!g_config.traceLifecycle) {
+                g_fn.prevKillImpl(
+                    a_self,
+                    a_attacker,
+                    a_damage,
+                    a_sendEvent,
+                    a_ragdollInstant);
                 return;
             }
-            const auto fn = IsAbsoluteTarget(a_self) ? g_fn.vanillaModAV : g_fn.prevModAV;
-            if (fn) {
-                fn(a_self, a_modifier, a_value, a_amount);
-            }
+
+            const auto id =
+                NextTraceID();
+
+            const auto caller =
+                reinterpret_cast<
+                    std::uintptr_t>(
+                        _ReturnAddress());
+
+            const auto before =
+                ReadHealth(
+                    a_self);
+
+            logger::info(
+                "[trace:{}] ENTER "
+                "KillImpl "
+                "self=0x{:08X} "
+                "attacker=0x{:08X} "
+                "damage={} "
+                "healthBefore={} "
+                "sendEvent={} "
+                "ragdoll={} "
+                "tid={} caller={}",
+                id,
+                a_self ?
+                    a_self->GetFormID() :
+                    0,
+                a_attacker ?
+                    a_attacker->GetFormID() :
+                    0,
+                a_damage,
+                before,
+                a_sendEvent,
+                a_ragdollInstant,
+                ::GetCurrentThreadId(),
+                FormatAddress(
+                    caller));
+
+            g_fn.prevKillImpl(
+                a_self,
+                a_attacker,
+                a_damage,
+                a_sendEvent,
+                a_ragdollInstant);
+
+            const auto after =
+                ReadHealth(
+                    a_self);
+
+            logger::info(
+                "[trace:{}] EXIT  "
+                "KillImpl "
+                "self=0x{:08X} "
+                "healthAfter={} "
+                "observedDelta={} "
+                "dead={}",
+                id,
+                a_self ?
+                    a_self->GetFormID() :
+                    0,
+                after,
+                after - before,
+                a_self ?
+                    a_self->IsDead() :
+                    false);
         }
 
-        void Hook_SetActorValue(RE::ActorValueOwner* a_self, RE::ActorValue a_value, float a_amount)
+        void Hook_KillDying(
+            RE::Actor* a_self)
         {
-            if (a_value == RE::ActorValue::kHealth && IsTerminal(a_self) && a_amount > 0.0F) {
-                logger::debug("Terminal death blocked positive Health SetActorValue ({})", a_amount);
+            if (!g_fn.prevKillDying) {
                 return;
             }
-            const auto fn = IsAbsoluteTarget(a_self) ? g_fn.vanillaSetAV : g_fn.prevSetAV;
-            if (fn) {
-                fn(a_self, a_value, a_amount);
-            }
-        }
 
-        template <class Fn>
-        Fn Pristine(std::uintptr_t a_vtable, std::size_t a_slot)
-        {
-            return reinterpret_cast<Fn>(g_pristine.ResolveVFunc(a_vtable, a_slot));
-        }
-
-        template <class Fn>
-        Fn Current(std::uintptr_t a_vtable, std::size_t a_slot)
-        {
-            return reinterpret_cast<Fn>(*reinterpret_cast<std::uintptr_t*>(a_vtable + a_slot * sizeof(void*)));
-        }
-
-        template <class Fn>
-        void EnsureHook(REL::Relocation<std::uintptr_t>& a_vtable, std::size_t a_slot, Fn a_hook, Fn& a_previous)
-        {
-            const auto hookAddress = reinterpret_cast<std::uintptr_t>(a_hook);
-            const auto currentAddress = *reinterpret_cast<std::uintptr_t*>(a_vtable.address() + a_slot * sizeof(void*));
-            if (currentAddress == hookAddress) {
+            if (!g_config.traceLifecycle) {
+                g_fn.prevKillDying(
+                    a_self);
                 return;
             }
-            a_previous = reinterpret_cast<Fn>(a_vtable.write_vfunc(a_slot, a_hook));
-            logger::info("Hooked vtable 0x{:X}[0x{:X}]: prev=0x{:X}, ours=0x{:X}",
-                a_vtable.address(), a_slot, reinterpret_cast<std::uintptr_t>(a_previous), hookAddress);
+
+            const auto id =
+                NextTraceID();
+
+            const auto caller =
+                reinterpret_cast<
+                    std::uintptr_t>(
+                        _ReturnAddress());
+
+            const auto before =
+                ReadHealth(
+                    a_self);
+
+            logger::info(
+                "[trace:{}] ENTER "
+                "KillDying "
+                "self=0x{:08X} "
+                "healthBefore={} "
+                "tid={} caller={}",
+                id,
+                a_self ?
+                    a_self->GetFormID() :
+                    0,
+                before,
+                ::GetCurrentThreadId(),
+                FormatAddress(
+                    caller));
+
+            g_fn.prevKillDying(
+                a_self);
+
+            const auto after =
+                ReadHealth(
+                    a_self);
+
+            logger::info(
+                "[trace:{}] EXIT  "
+                "KillDying "
+                "self=0x{:08X} "
+                "healthAfter={} "
+                "observedDelta={}",
+                id,
+                a_self ?
+                    a_self->GetFormID() :
+                    0,
+                after,
+                after - before);
+        }
+
+        void Hook_Resurrect(
+            RE::Actor* a_self,
+            bool a_resetInventory,
+            bool a_attach3D)
+        {
+            if (!g_fn.prevResurrect) {
+                return;
+            }
+
+            if (!g_config.traceLifecycle) {
+                g_fn.prevResurrect(
+                    a_self,
+                    a_resetInventory,
+                    a_attach3D);
+                return;
+            }
+
+            const auto id =
+                NextTraceID();
+
+            const auto caller =
+                reinterpret_cast<
+                    std::uintptr_t>(
+                        _ReturnAddress());
+
+            const auto before =
+                ReadHealth(
+                    a_self);
+
+            logger::info(
+                "[trace:{}] ENTER "
+                "Resurrect "
+                "self=0x{:08X} "
+                "healthBefore={} "
+                "resetInventory={} "
+                "attach3D={} "
+                "tid={} caller={}",
+                id,
+                a_self ?
+                    a_self->GetFormID() :
+                    0,
+                before,
+                a_resetInventory,
+                a_attach3D,
+                ::GetCurrentThreadId(),
+                FormatAddress(
+                    caller));
+
+            g_fn.prevResurrect(
+                a_self,
+                a_resetInventory,
+                a_attach3D);
+
+            const auto after =
+                ReadHealth(
+                    a_self);
+
+            logger::info(
+                "[trace:{}] EXIT  "
+                "Resurrect "
+                "self=0x{:08X} "
+                "healthAfter={} "
+                "observedDelta={} "
+                "dead={}",
+                id,
+                a_self ?
+                    a_self->GetFormID() :
+                    0,
+                after,
+                after - before,
+                a_self ?
+                    a_self->IsDead() :
+                    false);
+        }
+
+        float Hook_GetActorValue(
+            RE::ActorValueOwner* a_self,
+            RE::ActorValue a_value)
+        {
+            if (!g_fn.prevGetAV) {
+                return 0.0F;
+            }
+
+            const auto result =
+                g_fn.prevGetAV(
+                    a_self,
+                    a_value);
+
+            if (a_value ==
+                    RE::ActorValue::kHealth &&
+                g_config.traceHealthReads) {
+
+                const auto id =
+                    NextTraceID();
+
+                const auto caller =
+                    reinterpret_cast<
+                        std::uintptr_t>(
+                            _ReturnAddress());
+
+                logger::info(
+                    "[trace:{}] "
+                    "GetActorValue(Health) "
+                    "actor=0x{:08X} "
+                    "avo=0x{:X} "
+                    "result={} "
+                    "tid={} caller={}",
+                    id,
+                    ActorFormIDFromAVO(
+                        a_self),
+                    reinterpret_cast<
+                        std::uintptr_t>(
+                            a_self),
+                    result,
+                    ::GetCurrentThreadId(),
+                    FormatAddress(
+                        caller));
+            }
+
+            return result;
+        }
+
+        void Hook_SetBaseActorValue(
+            RE::ActorValueOwner* a_self,
+            RE::ActorValue a_value,
+            float a_amount)
+        {
+            if (!g_fn.prevSetBase) {
+                return;
+            }
+
+            if (a_value !=
+                    RE::ActorValue::kHealth ||
+                !g_config
+                    .traceActorValueCalls) {
+
+                g_fn.prevSetBase(
+                    a_self,
+                    a_value,
+                    a_amount);
+                return;
+            }
+
+            const auto id =
+                NextTraceID();
+
+            const auto caller =
+                reinterpret_cast<
+                    std::uintptr_t>(
+                        _ReturnAddress());
+
+            const auto before =
+                ReadHealth(
+                    a_self);
+
+            g_fn.prevSetBase(
+                a_self,
+                a_value,
+                a_amount);
+
+            const auto after =
+                ReadHealth(
+                    a_self);
+
+            logger::info(
+                "[trace:{}] "
+                "SetBaseActorValue(Health) "
+                "actor=0x{:08X} "
+                "avo=0x{:X} "
+                "amount={} "
+                "healthBefore={} "
+                "healthAfter={} "
+                "observedDelta={} "
+                "tid={} caller={}",
+                id,
+                ActorFormIDFromAVO(
+                    a_self),
+                reinterpret_cast<
+                    std::uintptr_t>(
+                        a_self),
+                a_amount,
+                before,
+                after,
+                after - before,
+                ::GetCurrentThreadId(),
+                FormatAddress(
+                    caller));
+        }
+
+        void Hook_ModActorValue(
+            RE::ActorValueOwner* a_self,
+            RE::ActorValue a_value,
+            float a_amount)
+        {
+            if (!g_fn.prevModAV) {
+                return;
+            }
+
+            if (a_value !=
+                    RE::ActorValue::kHealth ||
+                !g_config
+                    .traceActorValueCalls) {
+
+                g_fn.prevModAV(
+                    a_self,
+                    a_value,
+                    a_amount);
+                return;
+            }
+
+            const auto id =
+                NextTraceID();
+
+            const auto caller =
+                reinterpret_cast<
+                    std::uintptr_t>(
+                        _ReturnAddress());
+
+            const auto before =
+                ReadHealth(
+                    a_self);
+
+            g_fn.prevModAV(
+                a_self,
+                a_value,
+                a_amount);
+
+            const auto after =
+                ReadHealth(
+                    a_self);
+
+            logger::info(
+                "[trace:{}] "
+                "ModActorValue(Health) "
+                "actor=0x{:08X} "
+                "avo=0x{:X} "
+                "amount={} "
+                "healthBefore={} "
+                "healthAfter={} "
+                "observedDelta={} "
+                "tid={} caller={}",
+                id,
+                ActorFormIDFromAVO(
+                    a_self),
+                reinterpret_cast<
+                    std::uintptr_t>(
+                        a_self),
+                a_amount,
+                before,
+                after,
+                after - before,
+                ::GetCurrentThreadId(),
+                FormatAddress(
+                    caller));
+        }
+
+        void Hook_RestoreActorValue(
+            RE::ActorValueOwner* a_self,
+            RE::ACTOR_VALUE_MODIFIER
+                a_modifier,
+            RE::ActorValue a_value,
+            float a_amount)
+        {
+            if (!g_fn.prevRestoreAV) {
+                return;
+            }
+
+            if (a_value !=
+                    RE::ActorValue::kHealth ||
+                !g_config
+                    .traceActorValueCalls) {
+
+                g_fn.prevRestoreAV(
+                    a_self,
+                    a_modifier,
+                    a_value,
+                    a_amount);
+                return;
+            }
+
+            const auto id =
+                NextTraceID();
+
+            const auto caller =
+                reinterpret_cast<
+                    std::uintptr_t>(
+                        _ReturnAddress());
+
+            const auto before =
+                ReadHealth(
+                    a_self);
+
+            g_fn.prevRestoreAV(
+                a_self,
+                a_modifier,
+                a_value,
+                a_amount);
+
+            const auto after =
+                ReadHealth(
+                    a_self);
+
+            logger::info(
+                "[trace:{}] "
+                "RestoreActorValue(Health) "
+                "actor=0x{:08X} "
+                "avo=0x{:X} "
+                "modifier={} "
+                "amount={} "
+                "healthBefore={} "
+                "healthAfter={} "
+                "observedDelta={} "
+                "tid={} caller={}",
+                id,
+                ActorFormIDFromAVO(
+                    a_self),
+                reinterpret_cast<
+                    std::uintptr_t>(
+                        a_self),
+                static_cast<std::int32_t>(
+                    a_modifier),
+                a_amount,
+                before,
+                after,
+                after - before,
+                ::GetCurrentThreadId(),
+                FormatAddress(
+                    caller));
+        }
+
+        void Hook_SetActorValue(
+            RE::ActorValueOwner* a_self,
+            RE::ActorValue a_value,
+            float a_amount)
+        {
+            if (!g_fn.prevSetAV) {
+                return;
+            }
+
+            if (a_value !=
+                    RE::ActorValue::kHealth ||
+                !g_config
+                    .traceActorValueCalls) {
+
+                g_fn.prevSetAV(
+                    a_self,
+                    a_value,
+                    a_amount);
+                return;
+            }
+
+            const auto id =
+                NextTraceID();
+
+            const auto caller =
+                reinterpret_cast<
+                    std::uintptr_t>(
+                        _ReturnAddress());
+
+            const auto before =
+                ReadHealth(
+                    a_self);
+
+            g_fn.prevSetAV(
+                a_self,
+                a_value,
+                a_amount);
+
+            const auto after =
+                ReadHealth(
+                    a_self);
+
+            logger::info(
+                "[trace:{}] "
+                "SetActorValue(Health) "
+                "actor=0x{:08X} "
+                "avo=0x{:X} "
+                "amount={} "
+                "healthBefore={} "
+                "healthAfter={} "
+                "observedDelta={} "
+                "tid={} caller={}",
+                id,
+                ActorFormIDFromAVO(
+                    a_self),
+                reinterpret_cast<
+                    std::uintptr_t>(
+                        a_self),
+                a_amount,
+                before,
+                after,
+                after - before,
+                ::GetCurrentThreadId(),
+                FormatAddress(
+                    caller));
+        }
+
+        std::uintptr_t
+        DiscoverLiveActorAVOVTable()
+        {
+            auto* player =
+                RE::PlayerCharacter
+                    ::GetSingleton();
+
+            auto* avo =
+                player ?
+                    player
+                        ->AsActorValueOwner() :
+                    nullptr;
+
+            if (!player ||
+                !avo) {
+
+                return 0;
+            }
+
+            g_actorToAVOOffset =
+                static_cast<
+                    std::intptr_t>(
+                        reinterpret_cast<
+                            std::uintptr_t>(
+                                avo) -
+                        reinterpret_cast<
+                            std::uintptr_t>(
+                                player));
+
+            return *reinterpret_cast<
+                const std::uintptr_t*>(
+                    avo);
+        }
+
+        void DescribeInitialLayout(
+            std::uintptr_t a_actorVTable,
+            std::uintptr_t a_liveAVOVTable)
+        {
+            static bool
+                actorDescribed = false;
+
+            static bool
+                avoDescribed = false;
+
+            static REL::Relocation<
+                std::uintptr_t>
+                canonicalAVO{
+                    RE::VTABLE_ActorValueOwner[0]
+                };
+
+            if (!actorDescribed) {
+                actorDescribed = true;
+
+                logger::info(
+                    "[layout] Actor primary "
+                    "vtable=0x{:X}",
+                    a_actorVTable);
+
+                DescribeVTableSlot(
+                    "Actor::HandleHealthDamage",
+                    a_actorVTable,
+                    kActor_HandleHealthDamage);
+
+                DescribeVTableSlot(
+                    "Actor::KillImpl",
+                    a_actorVTable,
+                    kActor_KillImpl);
+
+                DescribeVTableSlot(
+                    "Actor::CheckClampDamageModifier",
+                    a_actorVTable,
+                    kActor_CheckClampDamageModifier);
+
+                DescribeVTableSlot(
+                    "Actor::KillDying",
+                    a_actorVTable,
+                    kActor_KillDying);
+
+                DescribeVTableSlot(
+                    "Actor::Resurrect",
+                    a_actorVTable,
+                    kActor_Resurrect);
+            }
+
+            if (a_liveAVOVTable &&
+                !avoDescribed) {
+
+                avoDescribed = true;
+
+                logger::info(
+                    "[layout] canonical "
+                    "ActorValueOwner "
+                    "vtable=0x{:X}; "
+                    "live Actor::ActorValueOwner "
+                    "vtable=0x{:X}; "
+                    "actorToAVOOffset=0x{:X}",
+                    canonicalAVO.address(),
+                    a_liveAVOVTable,
+                    static_cast<
+                        std::uintptr_t>(
+                            g_actorToAVOOffset));
+
+                DescribeVTableSlot(
+                    "ActorValueOwner::GetActorValue",
+                    a_liveAVOVTable,
+                    kAVO_GetActorValue);
+
+                DescribeVTableSlot(
+                    "ActorValueOwner::SetBaseActorValue",
+                    a_liveAVOVTable,
+                    kAVO_SetBaseActorValue);
+
+                DescribeVTableSlot(
+                    "ActorValueOwner::ModActorValue",
+                    a_liveAVOVTable,
+                    kAVO_ModActorValue);
+
+                DescribeVTableSlot(
+                    "ActorValueOwner::RestoreActorValue",
+                    a_liveAVOVTable,
+                    kAVO_RestoreActorValue);
+
+                DescribeVTableSlot(
+                    "ActorValueOwner::SetActorValue",
+                    a_liveAVOVTable,
+                    kAVO_SetActorValue);
+            }
+        }
+
+        void InspectCoreEntries(
+            std::uintptr_t a_actorVTable,
+            std::uintptr_t a_liveAVOVTable)
+        {
+            if (!g_config.traceIntegrity) {
+                return;
+            }
+
+            InspectPristineSlot(
+                "Actor::HandleHealthDamage",
+                a_actorVTable,
+                kActor_HandleHealthDamage);
+
+            InspectPristineSlot(
+                "Actor::KillImpl",
+                a_actorVTable,
+                kActor_KillImpl);
+
+            InspectPristineSlot(
+                "Actor::CheckClampDamageModifier",
+                a_actorVTable,
+                kActor_CheckClampDamageModifier);
+
+            InspectPristineSlot(
+                "Actor::KillDying",
+                a_actorVTable,
+                kActor_KillDying);
+
+            InspectPristineSlot(
+                "Actor::Resurrect",
+                a_actorVTable,
+                kActor_Resurrect);
+
+            if (a_liveAVOVTable) {
+                InspectPristineSlot(
+                    "ActorValueOwner::GetActorValue",
+                    a_liveAVOVTable,
+                    kAVO_GetActorValue);
+
+                InspectPristineSlot(
+                    "ActorValueOwner::SetBaseActorValue",
+                    a_liveAVOVTable,
+                    kAVO_SetBaseActorValue);
+
+                InspectPristineSlot(
+                    "ActorValueOwner::ModActorValue",
+                    a_liveAVOVTable,
+                    kAVO_ModActorValue);
+
+                InspectPristineSlot(
+                    "ActorValueOwner::RestoreActorValue",
+                    a_liveAVOVTable,
+                    kAVO_RestoreActorValue);
+
+                InspectPristineSlot(
+                    "ActorValueOwner::SetActorValue",
+                    a_liveAVOVTable,
+                    kAVO_SetActorValue);
+            }
         }
 
         bool InstallOrRefreshHooks()
         {
-            static REL::Relocation<std::uintptr_t> actorVTable{ RE::VTABLE_Actor[0] };
-            static REL::Relocation<std::uintptr_t> avoVTable{ RE::VTABLE_ActorValueOwner[0] };
+            static REL::Relocation<
+                std::uintptr_t>
+                actorVTable{
+                    RE::VTABLE_Actor[0]
+                };
 
-            if (!g_fn.vanillaHandleHealth) {
-                g_fn.vanillaHandleHealth = Pristine<HandleHealthDamage_t>(actorVTable.address(), kActor_HandleHealthDamage);
-                g_fn.vanillaKillImpl = Pristine<KillImpl_t>(actorVTable.address(), kActor_KillImpl);
-                g_fn.vanillaCheckClamp = Pristine<CheckClampDamageModifier_t>(actorVTable.address(), kActor_CheckClampDamageModifier);
-                g_fn.vanillaKillDying = Pristine<KillDying_t>(actorVTable.address(), kActor_KillDying);
-                g_fn.vanillaResurrect = Pristine<Resurrect_t>(actorVTable.address(), kActor_Resurrect);
+            const auto actorVT =
+                actorVTable.address();
 
-                g_fn.vanillaSetBase = Pristine<SetBaseActorValue_t>(avoVTable.address(), kAVO_SetBaseActorValue);
-                g_fn.vanillaModBase = Pristine<ModBaseActorValue_t>(avoVTable.address(), kAVO_ModBaseActorValue);
-                g_fn.vanillaModAV = Pristine<ModActorValue_t>(avoVTable.address(), kAVO_ModActorValue);
-                g_fn.vanillaSetAV = Pristine<SetActorValue_t>(avoVTable.address(), kAVO_SetActorValue);
+            const auto liveAVOVT =
+                DiscoverLiveActorAVOVTable();
 
-                const bool complete = g_fn.vanillaHandleHealth && g_fn.vanillaKillImpl && g_fn.vanillaCheckClamp &&
-                    g_fn.vanillaKillDying && g_fn.vanillaResurrect && g_fn.vanillaSetBase &&
-                    g_fn.vanillaModBase && g_fn.vanillaModAV && g_fn.vanillaSetAV;
-                if (!complete) {
-                    logger::critical("Could not recover all pristine Skyrim vtable functions. Hooks NOT installed.");
-                    return false;
-                }
+            DescribeInitialLayout(
+                actorVT,
+                liveAVOVT);
 
-                logger::info("Pristine Skyrim vtable functions recovered from the on-disk executable");
+            InspectCoreEntries(
+                actorVT,
+                liveAVOVT);
+
+            EnsureHook(
+                actorVT,
+                kActor_HandleHealthDamage,
+                Hook_HandleHealthDamage,
+                g_fn.prevHandleHealth,
+                "Actor::HandleHealthDamage");
+
+            EnsureHook(
+                actorVT,
+                kActor_KillImpl,
+                Hook_KillImpl,
+                g_fn.prevKillImpl,
+                "Actor::KillImpl");
+
+            EnsureHook(
+                actorVT,
+                kActor_CheckClampDamageModifier,
+                Hook_CheckClampDamageModifier,
+                g_fn.prevCheckClamp,
+                "Actor::CheckClampDamageModifier");
+
+            EnsureHook(
+                actorVT,
+                kActor_KillDying,
+                Hook_KillDying,
+                g_fn.prevKillDying,
+                "Actor::KillDying");
+
+            EnsureHook(
+                actorVT,
+                kActor_Resurrect,
+                Hook_Resurrect,
+                g_fn.prevResurrect,
+                "Actor::Resurrect");
+
+            if (!liveAVOVT) {
+                logger::warn(
+                    "[layout] live "
+                    "Actor::ActorValueOwner "
+                    "vtable not available yet; "
+                    "AVO hooks deferred");
+
+                return true;
             }
 
-            EnsureHook(actorVTable, kActor_HandleHealthDamage, Hook_HandleHealthDamage, g_fn.prevHandleHealth);
-            EnsureHook(actorVTable, kActor_KillImpl, Hook_KillImpl, g_fn.prevKillImpl);
-            EnsureHook(actorVTable, kActor_CheckClampDamageModifier, Hook_CheckClampDamageModifier, g_fn.prevCheckClamp);
-            EnsureHook(actorVTable, kActor_KillDying, Hook_KillDying, g_fn.prevKillDying);
-            EnsureHook(actorVTable, kActor_Resurrect, Hook_Resurrect, g_fn.prevResurrect);
+            if (g_liveActorAVOVTable != 0 &&
+                g_liveActorAVOVTable !=
+                    liveAVOVT) {
 
-            EnsureHook(avoVTable, kAVO_SetBaseActorValue, Hook_SetBaseActorValue, g_fn.prevSetBase);
-            EnsureHook(avoVTable, kAVO_ModBaseActorValue, Hook_ModBaseActorValue, g_fn.prevModBase);
-            EnsureHook(avoVTable, kAVO_ModActorValue, Hook_ModActorValue, g_fn.prevModAV);
-            EnsureHook(avoVTable, kAVO_SetActorValue, Hook_SetActorValue, g_fn.prevSetAV);
+                logger::warn(
+                    "[layout] live "
+                    "Actor::ActorValueOwner "
+                    "vtable changed from "
+                    "0x{:X} to 0x{:X}; "
+                    "not replacing existing "
+                    "previous pointers",
+                    g_liveActorAVOVTable,
+                    liveAVOVT);
+
+                return true;
+            }
+
+            g_liveActorAVOVTable =
+                liveAVOVT;
+
+            const auto currentGetAV =
+                *reinterpret_cast<
+                    std::uintptr_t*>(
+                        liveAVOVT +
+                        kAVO_GetActorValue *
+                            sizeof(void*));
+
+            if (!g_config.traceHealthReads) {
+                g_fn.prevGetAV =
+                    reinterpret_cast<
+                        GetActorValue_t>(
+                            currentGetAV);
+            } else {
+                EnsureHook(
+                    liveAVOVT,
+                    kAVO_GetActorValue,
+                    Hook_GetActorValue,
+                    g_fn.prevGetAV,
+                    "ActorValueOwner::GetActorValue");
+            }
+
+            EnsureHook(
+                liveAVOVT,
+                kAVO_SetBaseActorValue,
+                Hook_SetBaseActorValue,
+                g_fn.prevSetBase,
+                "ActorValueOwner::SetBaseActorValue");
+
+            EnsureHook(
+                liveAVOVT,
+                kAVO_ModActorValue,
+                Hook_ModActorValue,
+                g_fn.prevModAV,
+                "ActorValueOwner::ModActorValue");
+
+            EnsureHook(
+                liveAVOVT,
+                kAVO_RestoreActorValue,
+                Hook_RestoreActorValue,
+                g_fn.prevRestoreAV,
+                "ActorValueOwner::RestoreActorValue");
+
+            EnsureHook(
+                liveAVOVT,
+                kAVO_SetActorValue,
+                Hook_SetActorValue,
+                g_fn.prevSetAV,
+                "ActorValueOwner::SetActorValue");
+
             return true;
         }
 
         void SetupLog()
         {
-            auto path = logger::log_directory();
+            auto path =
+                logger::log_directory();
+
             if (!path) {
                 return;
             }
-            *path /= "UniversalCombatArbiter.log";
-            auto sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(path->string(), true);
-            auto log = std::make_shared<spdlog::logger>("global", std::move(sink));
-            log->set_level(spdlog::level::debug);
-            log->flush_on(spdlog::level::debug);
-            spdlog::set_default_logger(std::move(log));
-            spdlog::set_pattern("[%H:%M:%S.%e] [%l] %v");
+
+            *path /=
+                "UniversalCombatArbiter.log";
+
+            auto sink =
+                std::make_shared<
+                    spdlog::sinks::
+                        basic_file_sink_mt>(
+                            path->string(),
+                            true);
+
+            auto log =
+                std::make_shared<
+                    spdlog::logger>(
+                        "global",
+                        std::move(
+                            sink));
+
+            log->set_level(
+                spdlog::level::debug);
+
+            log->flush_on(
+                spdlog::level::debug);
+
+            spdlog::set_default_logger(
+                std::move(log));
+
+            spdlog::set_pattern(
+                "[%H:%M:%S.%e] [%l] %v");
         }
 
-        void MessageHandler(SKSE::MessagingInterface::Message* a_message)
+        void MessageHandler(
+            SKSE::MessagingInterface::
+                Message* a_message)
         {
             if (!a_message) {
                 return;
             }
 
-            switch (a_message->type) {
-            case SKSE::MessagingInterface::kPostPostLoad:
-                // Most SKSE plugins have finished their initial hook installation by here.
+            switch (
+                a_message->type) {
+
+            case SKSE::MessagingInterface::
+                kPostPostLoad:
+
                 InstallOrRefreshHooks();
                 break;
-            case SKSE::MessagingInterface::kDataLoaded:
-                ResolveConfiguredAttacker();
-                // Re-wrap once immediately and once on the game task queue.  The latter intentionally
-                // runs after DataLoaded listeners that may install their own vtable hooks.
+
+            case SKSE::MessagingInterface::
+                kDataLoaded:
+
                 InstallOrRefreshHooks();
-                if (auto* tasks = SKSE::GetTaskInterface()) {
-                    tasks->AddTask([]() { InstallOrRefreshHooks(); });
+
+                if (auto* tasks =
+                        SKSE::
+                            GetTaskInterface()) {
+
+                    tasks->AddTask(
+                        []() {
+                            InstallOrRefreshHooks();
+                        });
                 }
+
                 break;
-            case SKSE::MessagingInterface::kPostLoadGame:
-            case SKSE::MessagingInterface::kNewGame:
-                if (auto* tasks = SKSE::GetTaskInterface()) {
-                    tasks->AddTask([]() {
-                        ResolveConfiguredAttacker();
-                        InstallOrRefreshHooks();
-                    });
+
+            case SKSE::MessagingInterface::
+                kPostLoadGame:
+
+            case SKSE::MessagingInterface::
+                kNewGame:
+
+                if (auto* tasks =
+                        SKSE::
+                            GetTaskInterface()) {
+
+                    tasks->AddTask(
+                        []() {
+                            InstallOrRefreshHooks();
+                        });
                 }
+
                 break;
+
             default:
                 break;
             }
         }
     }
 
-    bool Initialize(const SKSE::LoadInterface* a_skse)
+    bool Initialize(
+        const SKSE::LoadInterface* a_skse)
     {
         SetupLog();
-        logger::info("UniversalCombatArbiter loading; runtime {}", a_skse->RuntimeVersion().string());
+
+        logger::info(
+            "UniversalCombatArbiter "
+            "PoC2 Health Pipeline Tracer "
+            "loading; runtime {}",
+            a_skse
+                ->RuntimeVersion()
+                .string());
 
         LoadConfig();
+
         if (!g_pristine.Load()) {
-            logger::critical("Failed to read the pristine Skyrim executable; plugin disabled");
+            logger::critical(
+                "Failed to read pristine "
+                "Skyrim executable; "
+                "tracer disabled");
+
             return true;
         }
 
-        auto* messaging = SKSE::GetMessagingInterface();
-        if (!messaging || !messaging->RegisterListener(MessageHandler)) {
-            logger::critical("Could not register SKSE message listener");
+        auto* messaging =
+            SKSE::
+                GetMessagingInterface();
+
+        if (!messaging ||
+            !messaging->RegisterListener(
+                MessageHandler)) {
+
+            logger::critical(
+                "Could not register "
+                "SKSE message listener");
+
             return false;
         }
 
@@ -632,8 +2140,11 @@ namespace UCA
     }
 }
 
-SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
+SKSEPluginLoad(
+    const SKSE::LoadInterface* a_skse)
 {
     SKSE::Init(a_skse);
-    return UCA::Initialize(a_skse);
+
+    return UCA::Initialize(
+        a_skse);
 }
