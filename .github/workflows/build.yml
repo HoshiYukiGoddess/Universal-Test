@@ -8,22 +8,39 @@ permissions:
 
 env:
   COMMONLIB_TAG: v8.1.0
+  VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}\\vcpkg-cache,readwrite"
 
 jobs:
   build:
     runs-on: windows-2022
-    timeout-minutes: 90
+    timeout-minutes: 45
 
     steps:
-      - name: Checkout this project
+      - name: Checkout project
         uses: actions/checkout@v4
+
+      - name: Cache vcpkg binary packages
+        uses: actions/cache@v4
+        with:
+          path: vcpkg-cache
+          key: vcpkg-${{ runner.os }}-${{ env.COMMONLIB_TAG }}-v1
+          restore-keys: |
+            vcpkg-${{ runner.os }}-${{ env.COMMONLIB_TAG }}-
 
       - name: Download CommonLibSSE-NG
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force extern | Out-Null
-          git clone --depth 1 --branch $env:COMMONLIB_TAG --recurse-submodules `
-            https://github.com/alandtse/CommonLibSSE-NG.git extern/CommonLibSSE-NG
+
+          if (Test-Path "extern/CommonLibSSE-NG") {
+            Remove-Item "extern/CommonLibSSE-NG" -Recurse -Force
+          }
+
+          git clone --depth 1 `
+            --branch $env:COMMONLIB_TAG `
+            --recurse-submodules `
+            https://github.com/alandtse/CommonLibSSE-NG.git `
+            extern/CommonLibSSE-NG
 
       - name: Set up vcpkg
         shell: pwsh
@@ -31,7 +48,7 @@ jobs:
           git clone --depth 1 https://github.com/microsoft/vcpkg.git C:\vcpkg
           & C:\vcpkg\bootstrap-vcpkg.bat -disableMetrics
 
-      - name: Configure with Visual Studio 2022
+      - name: Configure
         shell: pwsh
         run: |
           cmake -S . -B build `
@@ -41,25 +58,47 @@ jobs:
             -DBUILD_TESTS=OFF `
             -DENABLE_SKYRIM_SE=ON `
             -DENABLE_SKYRIM_AE=ON `
-            -DENABLE_SKYRIM_VR=OFF `
+            -DENABLE_SKYRIM_VR=ON `
+            -DCOMMONLIB_PREBUILT_MULTICONFIG=ON `
             -DCOMMONLIB_ENABLE_IPO=OFF
 
       - name: Build Release DLL
         shell: pwsh
-        run: cmake --build build --config Release --target UniversalCombatArbiter --parallel 2
+        run: |
+          cmake --build build `
+            --config Release `
+            --target UniversalCombatArbiter `
+            --parallel 2
 
-      - name: Make installable ZIP layout
+      - name: Make installable layout
         shell: pwsh
         run: |
           $out = "artifact/Data/SKSE/Plugins"
           New-Item -ItemType Directory -Force $out | Out-Null
-          $dll = Get-ChildItem -Path build -Recurse -Filter UniversalCombatArbiter.dll | Select-Object -First 1
-          if (-not $dll) { throw "UniversalCombatArbiter.dll was not produced." }
-          Copy-Item $dll.FullName "$out/UniversalCombatArbiter.dll"
-          Copy-Item "config/UniversalCombatArbiter.ini" "$out/UniversalCombatArbiter.ini"
-          $pdb = Get-ChildItem -Path build -Recurse -Filter UniversalCombatArbiter.pdb | Select-Object -First 1
-          if ($pdb) { Copy-Item $pdb.FullName "$out/UniversalCombatArbiter.pdb" }
-          Get-ChildItem -Recurse artifact
+
+          $dll = Get-ChildItem build -Recurse `
+            -Filter UniversalCombatArbiter.dll |
+            Select-Object -First 1
+
+          if (-not $dll) {
+            throw "UniversalCombatArbiter.dll was not produced."
+          }
+
+          Copy-Item $dll.FullName `
+            "$out/UniversalCombatArbiter.dll"
+
+          Copy-Item `
+            "config/UniversalCombatArbiter.ini" `
+            "$out/UniversalCombatArbiter.ini"
+
+          $pdb = Get-ChildItem build -Recurse `
+            -Filter UniversalCombatArbiter.pdb |
+            Select-Object -First 1
+
+          if ($pdb) {
+            Copy-Item $pdb.FullName `
+              "$out/UniversalCombatArbiter.pdb"
+          }
 
       - name: Upload compiled plugin
         uses: actions/upload-artifact@v4
