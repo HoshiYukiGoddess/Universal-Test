@@ -23,9 +23,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: vcpkg-cache
-          key: vcpkg-${{ runner.os }}-${{ env.COMMONLIB_TAG }}-v1
+          key: vcpkg-${{ runner.os }}-${{ env.COMMONLIB_TAG }}-static-md-v2
           restore-keys: |
-            vcpkg-${{ runner.os }}-${{ env.COMMONLIB_TAG }}-
+            vcpkg-${{ runner.os }}-${{ env.COMMONLIB_TAG }}-static-md-
 
       - name: Download CommonLibSSE-NG
         shell: pwsh
@@ -45,7 +45,16 @@ jobs:
       - name: Set up vcpkg
         shell: pwsh
         run: |
-          git clone --depth 1 https://github.com/microsoft/vcpkg.git C:\vcpkg
+          if (-not (Test-Path "C:\vcpkg\bootstrap-vcpkg.bat")) {
+            if (Test-Path "C:\vcpkg") {
+              Remove-Item "C:\vcpkg" -Recurse -Force
+            }
+
+            git clone --depth 1 `
+              https://github.com/microsoft/vcpkg.git `
+              C:\vcpkg
+          }
+
           & C:\vcpkg\bootstrap-vcpkg.bat -disableMetrics
 
       - name: Configure
@@ -54,6 +63,7 @@ jobs:
           cmake -S . -B build `
             -G "Visual Studio 18 2026" -A x64 `
             -DCMAKE_TOOLCHAIN_FILE="C:/vcpkg/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static-md `
             -DVCPKG_MANIFEST_DIR="${{ github.workspace }}/extern/CommonLibSSE-NG" `
             -DBUILD_TESTS=OFF `
             -DENABLE_SKYRIM_SE=ON `
@@ -86,16 +96,6 @@ jobs:
 
           Copy-Item $dll.FullName `
             "$out/UniversalCombatArbiter.dll"
-
-          $fmt = Get-ChildItem build -Recurse -Filter fmt.dll | Select-Object -First 1
-          if ($fmt) {
-            Copy-Item $fmt.FullName "$out/fmt.dll"
-          }
-
-          $spdlog = Get-ChildItem build -Recurse -Filter spdlog.dll | Select-Object -First 1
-          if ($spdlog) {
-            Copy-Item $spdlog.FullName "$out/spdlog.dll"
-          }
 
           Copy-Item `
             "config/UniversalCombatArbiter.ini" `
