@@ -13,28 +13,20 @@ namespace UCA
 {
     namespace
     {
-        constexpr std::size_t kActor_KillDying = 0x0AA;
-        constexpr std::size_t kActor_Resurrect = 0x0AB;
         constexpr std::size_t kActor_HandleHealthDamage = 0x104;
-        constexpr std::size_t kActor_KillImpl = 0x10E;
         constexpr std::size_t kActor_CheckClampDamageModifier = 0x127;
-
-        constexpr std::size_t kAVO_GetActorValue = 0x01;
-        constexpr std::size_t kAVO_SetBaseActorValue = 0x04;
-        constexpr std::size_t kAVO_ModActorValue = 0x05;
-        constexpr std::size_t kAVO_RestoreActorValue = 0x06;
-        constexpr std::size_t kAVO_SetActorValue = 0x07;
 
         struct Config
         {
             bool traceHitEvents{ true };
             bool traceVTableCalls{ true };
             bool traceEntryCalls{ true };
-            bool traceLifecycle{ true };
         };
 
         Config g_config;
         bool g_runtime1170{ false };
+        bool g_tracingInstalled{ false };
+        bool g_hitSinkRegistered{ false };
 
         std::filesystem::path GetIniPath()
         {
@@ -70,14 +62,12 @@ namespace UCA
             g_config.traceHitEvents = ReadIniBool("bTraceHitEvents", true);
             g_config.traceVTableCalls = ReadIniBool("bTraceVTableCalls", true);
             g_config.traceEntryCalls = ReadIniBool("bTraceEntryCalls", true);
-            g_config.traceLifecycle = ReadIniBool("bTraceLifecycle", true);
 
             logger::info(
-                "PoC3 config: hitEvents={}, vtableCalls={}, entryCalls={}, lifecycle={}",
+                "PoC3.1 config: hitEvents={}, vtableCalls={}, entryCalls={}",
                 g_config.traceHitEvents,
                 g_config.traceVTableCalls,
-                g_config.traceEntryCalls,
-                g_config.traceLifecycle);
+                g_config.traceEntryCalls);
         }
 
         std::uint64_t NextTraceID()
@@ -150,9 +140,7 @@ namespace UCA
                 info.address);
         }
 
-        std::string MemoryBytes(
-            std::uintptr_t a_address,
-            std::size_t a_count)
+        std::string MemoryBytes(std::uintptr_t a_address, std::size_t a_count)
         {
             if (!a_address || a_count == 0) {
                 return {};
@@ -191,57 +179,13 @@ namespace UCA
                 current);
         }
 
-        void WriteNops(
-            std::uintptr_t a_address,
-            std::size_t a_count)
-        {
-            if (!a_address || a_count == 0) {
-                return;
-            }
-
-            DWORD oldProtect = 0;
-            if (!::VirtualProtect(
-                    reinterpret_cast<void*>(a_address),
-                    a_count,
-                    PAGE_EXECUTE_READWRITE,
-                    &oldProtect)) {
-                logger::error(
-                    "VirtualProtect failed while filling NOPs at 0x{:X}",
-                    a_address);
-                return;
-            }
-
-            std::memset(
-                reinterpret_cast<void*>(a_address),
-                0x90,
-                a_count);
-
-            ::FlushInstructionCache(
-                ::GetCurrentProcess(),
-                reinterpret_cast<const void*>(a_address),
-                a_count);
-
-            DWORD ignored = 0;
-            ::VirtualProtect(
-                reinterpret_cast<void*>(a_address),
-                a_count,
-                oldProtect,
-                &ignored);
-        }
-
-        void EmitAbsoluteJump(
-            std::uint8_t* a_dst,
-            std::uintptr_t a_target)
+        void EmitAbsoluteJump(std::uint8_t* a_dst, std::uintptr_t a_target)
         {
             static constexpr std::array<std::uint8_t, 6> prefix{
                 0xFF, 0x25, 0x00, 0x00, 0x00, 0x00
             };
 
-            std::memcpy(
-                a_dst,
-                prefix.data(),
-                prefix.size());
-
+            std::memcpy(a_dst, prefix.data(), prefix.size());
             std::memcpy(
                 a_dst + prefix.size(),
                 &a_target,
@@ -362,7 +306,7 @@ namespace UCA
 
                 const auto entryRva =
                     vtableRva +
-                    (a_slot * sizeof(std::uintptr_t));
+                    a_slot * sizeof(std::uintptr_t);
 
                 const auto fileOffset =
                     RvaToFileOffset(entryRva);
@@ -399,7 +343,8 @@ namespace UCA
 
                 for (const auto& section : _sections) {
                     const auto begin =
-                        static_cast<std::uintptr_t>(section.VirtualAddress);
+                        static_cast<std::uintptr_t>(
+                            section.VirtualAddress);
 
                     const auto span =
                         static_cast<std::uintptr_t>(
@@ -435,98 +380,30 @@ namespace UCA
         using HandleHealthDamage_t =
             void (*)(RE::Actor*, RE::Actor*, float);
 
-        using KillImpl_t =
-            void (*)(RE::Actor*, RE::Actor*, float, bool, bool);
-
         using CheckClampDamageModifier_t =
             float (*)(RE::Actor*, RE::ActorValue, float);
-
-        using KillDying_t =
-            void (*)(RE::Actor*);
-
-        using Resurrect_t =
-            void (*)(RE::Actor*, bool, bool);
-
-        using SetBaseActorValue_t =
-            void (*)(RE::ActorValueOwner*, RE::ActorValue, float);
-
-        using ModActorValue_t =
-            void (*)(RE::ActorValueOwner*, RE::ActorValue, float);
-
-        using RestoreActorValue_t =
-            void (*)(
-                RE::ActorValueOwner*,
-                RE::ACTOR_VALUE_MODIFIER,
-                RE::ActorValue,
-                float);
-
-        using SetActorValue_t =
-            void (*)(RE::ActorValueOwner*, RE::ActorValue, float);
 
         struct VTableFunctions
         {
             HandleHealthDamage_t handleHealth{};
-            KillImpl_t killImpl{};
             CheckClampDamageModifier_t checkClamp{};
-            KillDying_t killDying{};
-            Resurrect_t resurrect{};
-
-            SetBaseActorValue_t setBase{};
-            ModActorValue_t modAV{};
-            RestoreActorValue_t restoreAV{};
-            SetActorValue_t setAV{};
         };
 
         struct EntryFunctions
         {
             HandleHealthDamage_t handleHealth{};
-            KillImpl_t killImpl{};
             CheckClampDamageModifier_t checkClamp{};
-
-            ModActorValue_t modAV{};
-            RestoreActorValue_t restoreAV{};
-            SetActorValue_t setAV{};
         };
-
-        VTableFunctions g_vtablePrev{};
-        EntryFunctions g_entryOriginal{};
 
         struct EngineTargets
         {
             std::uintptr_t handleHealth{};
-            std::uintptr_t killImpl{};
             std::uintptr_t checkClamp{};
-
-            std::uintptr_t setBase{};
-            std::uintptr_t modAV{};
-            std::uintptr_t restoreAV{};
-            std::uintptr_t setAV{};
         };
 
+        VTableFunctions g_vtablePrev{};
+        EntryFunctions g_entryOriginal{};
         EngineTargets g_targets{};
-
-        std::uintptr_t g_liveActorAVOVTable{};
-        std::intptr_t g_actorToAVOOffset{};
-
-        float ReadHealth(RE::Actor* a_actor)
-        {
-            if (!a_actor) {
-                return 0.0F;
-            }
-
-            return a_actor->GetActorValue(
-                RE::ActorValue::kHealth);
-        }
-
-        float ReadHealth(RE::ActorValueOwner* a_owner)
-        {
-            if (!a_owner) {
-                return 0.0F;
-            }
-
-            return a_owner->GetActorValue(
-                RE::ActorValue::kHealth);
-        }
 
         template <class Fn>
         Fn WriteVFuncRaw(
@@ -551,17 +428,21 @@ namespace UCA
                     PAGE_READWRITE,
                     &oldProtect)) {
                 logger::error(
-                    "VirtualProtect failed for vtable=0x{:X}[0x{:X}]",
+                    "VirtualProtect failed for "
+                    "vtable=0x{:X}[0x{:X}]",
                     a_vtable,
                     a_slot);
                 return nullptr;
             }
 
             const auto previous = *entry;
+
             *entry =
-                reinterpret_cast<std::uintptr_t>(a_hook);
+                reinterpret_cast<std::uintptr_t>(
+                    a_hook);
 
             DWORD ignored = 0;
+
             ::VirtualProtect(
                 entry,
                 sizeof(*entry),
@@ -572,7 +453,7 @@ namespace UCA
         }
 
         template <class Fn>
-        void EnsureVTableHook(
+        void InstallVTableHookOnce(
             std::uintptr_t a_vtable,
             std::size_t a_slot,
             Fn a_hook,
@@ -581,21 +462,15 @@ namespace UCA
         {
             if (!g_config.traceVTableCalls ||
                 !a_vtable ||
-                !a_hook) {
+                !a_hook ||
+                a_previous) {
                 return;
             }
-
-            const auto hookAddress =
-                reinterpret_cast<std::uintptr_t>(a_hook);
 
             const auto currentAddress =
                 *reinterpret_cast<std::uintptr_t*>(
                     a_vtable +
                     a_slot * sizeof(void*));
-
-            if (currentAddress == hookAddress) {
-                return;
-            }
 
             a_previous =
                 WriteVFuncRaw(
@@ -604,184 +479,101 @@ namespace UCA
                     a_hook);
 
             logger::info(
-                "[vhook] {} vtable=0x{:X}[0x{:X}] prev={} ours={}",
+                "[vhook] {} "
+                "vtable=0x{:X}[0x{:X}] "
+                "prev={} ours={}",
                 a_label,
                 a_vtable,
                 a_slot,
+                FormatAddress(currentAddress),
                 FormatAddress(
-                    reinterpret_cast<std::uintptr_t>(a_previous)),
-                FormatAddress(hookAddress));
-        }
-
-        bool EntryBranchStillPointsTo(
-            std::uintptr_t a_target,
-            std::uintptr_t a_hook)
-        {
-            if (!a_target || !a_hook) {
-                return false;
-            }
-
-            const auto* src =
-                reinterpret_cast<const std::uint8_t*>(a_target);
-
-            if (src[0] != 0xE9) {
-                return false;
-            }
-
-            std::int32_t disp = 0;
-            std::memcpy(
-                &disp,
-                src + 1,
-                sizeof(disp));
-
-            const auto island =
-                static_cast<std::uintptr_t>(
-                    static_cast<std::intptr_t>(a_target + 5) +
-                    static_cast<std::intptr_t>(disp));
-
-            const auto* stub =
-                reinterpret_cast<const std::uint8_t*>(island);
-
-            static constexpr std::array<std::uint8_t, 6> expected{
-                0xFF, 0x25, 0x00, 0x00, 0x00, 0x00
-            };
-
-            if (!std::equal(
-                    expected.begin(),
-                    expected.end(),
-                    stub)) {
-                return false;
-            }
-
-            std::uintptr_t destination = 0;
-            std::memcpy(
-                &destination,
-                stub + expected.size(),
-                sizeof(destination));
-
-            return destination == a_hook;
+                    reinterpret_cast<std::uintptr_t>(
+                        a_hook)));
         }
 
         template <class Fn>
-        bool InstallEntryHook(
+        bool InstallFiveByteEntryHook(
             std::string_view a_label,
             std::uintptr_t a_target,
             Fn a_hook,
-            Fn& a_original,
-            std::initializer_list<std::uint8_t> a_expectedPrefix)
+            Fn& a_original)
         {
             if (!g_config.traceEntryCalls ||
-                !g_runtime1170) {
+                !g_runtime1170 ||
+                a_original ||
+                !a_target ||
+                !a_hook) {
                 return false;
             }
 
-            if (a_original) {
-                const auto hookAddress =
-                    reinterpret_cast<std::uintptr_t>(a_hook);
-
-                const bool intact =
-                    EntryBranchStillPointsTo(
-                        a_target,
-                        hookAddress);
-
-                if (!intact) {
-                    logger::warn(
-                        "[entry-check] {} entry detour is no longer ours; "
-                        "current bytes=[{}]. PoC3 will not fight for the "
-                        "function entry.",
-                        a_label,
-                        MemoryBytes(a_target, 16));
-                }
-
-                return intact;
-            }
-
-            if (!a_target ||
-                !a_hook ||
-                a_expectedPrefix.size() < 5) {
-                logger::warn(
-                    "[entry-install] {} invalid target/hook/prefix",
-                    a_label);
-                return false;
-            }
-
-            const auto previewCount =
-                std::max<std::size_t>(
-                    16,
-                    a_expectedPrefix.size());
+            static constexpr std::array<std::uint8_t, 5> expected{
+                0x48, 0x89, 0x5C, 0x24, 0x08
+            };
 
             const bool prefixOK =
                 PrefixMatches(
                     a_target,
-                    a_expectedPrefix);
+                    {
+                        expected[0],
+                        expected[1],
+                        expected[2],
+                        expected[3],
+                        expected[4]
+                    });
 
             logger::info(
-                "[prologue] {} target={} prefixMatch={} bytes=[{}]",
+                "[prologue] {} "
+                "target={} prefixMatch={} bytes=[{}]",
                 a_label,
                 FormatAddress(a_target),
                 prefixOK,
-                MemoryBytes(
-                    a_target,
-                    previewCount));
+                MemoryBytes(a_target, 16));
 
             if (!prefixOK) {
                 logger::warn(
-                    "[entry-install] {} NOT patched because the "
-                    "1.6.1170 prologue did not match. "
-                    "This can indicate an existing inline hook or "
-                    "a different engine build.",
+                    "[entry-install] {} skipped because "
+                    "the verified 1.6.1170 five-byte "
+                    "prologue does not match",
                     a_label);
                 return false;
             }
-
-            const auto stolenLength =
-                a_expectedPrefix.size();
 
             auto& trampoline =
                 SKSE::GetTrampoline();
 
             auto* gateway =
                 static_cast<std::uint8_t*>(
-                    trampoline.allocate(
-                        stolenLength + 14));
+                    trampoline.allocate(19));
 
             std::memcpy(
                 gateway,
-                reinterpret_cast<const void*>(
-                    a_target),
-                stolenLength);
+                reinterpret_cast<const void*>(a_target),
+                5);
 
             EmitAbsoluteJump(
-                gateway + stolenLength,
-                a_target + stolenLength);
+                gateway + 5,
+                a_target + 5);
 
             a_original =
-                reinterpret_cast<Fn>(
-                    gateway);
+                reinterpret_cast<Fn>(gateway);
 
             (void)trampoline.write_branch<5>(
                 a_target,
                 a_hook);
 
-            if (stolenLength > 5) {
-                WriteNops(
-                    a_target + 5,
-                    stolenLength - 5);
-            }
-
             ::FlushInstructionCache(
                 ::GetCurrentProcess(),
-                reinterpret_cast<const void*>(
-                    a_target),
-                stolenLength);
+                reinterpret_cast<const void*>(a_target),
+                5);
 
             logger::info(
-                "[entry-install] {} target={} gateway=0x{:X} stolen={} bytes",
+                "[entry-install] {} "
+                "target={} gateway=0x{:X} "
+                "stolen=5 bytes",
                 a_label,
                 FormatAddress(a_target),
                 reinterpret_cast<std::uintptr_t>(
-                    gateway),
-                stolenLength);
+                    gateway));
 
             return true;
         }
@@ -799,10 +591,9 @@ namespace UCA
             }
 
             const auto current =
-                *reinterpret_cast<
-                    const std::uintptr_t*>(
-                        a_vtable +
-                        a_slot * sizeof(void*));
+                *reinterpret_cast<const std::uintptr_t*>(
+                    a_vtable +
+                    a_slot * sizeof(void*));
 
             const auto pristine =
                 g_pristine.ResolveVFunc(
@@ -810,7 +601,8 @@ namespace UCA
                     a_slot);
 
             logger::info(
-                "[slot] {} vtable=0x{:X}[0x{:X}] "
+                "[slot] {} "
+                "vtable=0x{:X}[0x{:X}] "
                 "current={} pristine={} same={}",
                 a_label,
                 a_vtable,
@@ -836,56 +628,39 @@ namespace UCA
                     return RE::BSEventNotifyControl::kContinue;
                 }
 
-                auto* targetRef =
+                // Deliberately no Actor casts, no ActorValueOwner calls,
+                // and no Health reads inside the hit callback.
+                auto* target =
                     a_event->target.get();
 
-                auto* causeRef =
+                auto* cause =
                     a_event->cause.get();
 
-                auto* targetActor =
-                    targetRef ?
-                        targetRef->As<RE::Actor>() :
-                        nullptr;
-
-                auto* causeActor =
-                    causeRef ?
-                        causeRef->As<RE::Actor>() :
-                        nullptr;
-
-                auto* targetAVO =
-                    targetActor ?
-                        targetActor->AsActorValueOwner() :
-                        nullptr;
-
-                const auto id =
-                    NextTraceID();
-
                 logger::info(
-                    "[hit:{}] targetForm=0x{:08X} "
-                    "targetActor=0x{:X} targetAVO=0x{:X} "
-                    "causeForm=0x{:08X} causeActor=0x{:X} "
-                    "source=0x{:08X} projectile=0x{:08X} "
-                    "flags=0x{:02X} health={} tid={}",
-                    id,
-                    targetRef ?
-                        targetRef->GetFormID() :
+                    "[hit:{}] "
+                    "targetPtr=0x{:X} "
+                    "targetForm=0x{:08X} "
+                    "causePtr=0x{:X} "
+                    "causeForm=0x{:08X} "
+                    "source=0x{:08X} "
+                    "projectile=0x{:08X} "
+                    "flags=0x{:02X} "
+                    "tid={}",
+                    NextTraceID(),
+                    reinterpret_cast<std::uintptr_t>(
+                        target),
+                    target ?
+                        target->GetFormID() :
                         0,
                     reinterpret_cast<std::uintptr_t>(
-                        targetActor),
-                    reinterpret_cast<std::uintptr_t>(
-                        targetAVO),
-                    causeRef ?
-                        causeRef->GetFormID() :
+                        cause),
+                    cause ?
+                        cause->GetFormID() :
                         0,
-                    reinterpret_cast<std::uintptr_t>(
-                        causeActor),
                     a_event->source,
                     a_event->projectile,
                     static_cast<std::uint32_t>(
                         a_event->flags.underlying()),
-                    targetActor ?
-                        ReadHealth(targetActor) :
-                        0.0F,
                     ::GetCurrentThreadId());
 
                 return RE::BSEventNotifyControl::kContinue;
@@ -893,7 +668,6 @@ namespace UCA
         };
 
         HitEventSink g_hitSink;
-        bool g_hitSinkRegistered{ false };
 
         void RegisterHitEventSink()
         {
@@ -915,7 +689,9 @@ namespace UCA
                 &g_hitSink);
 
             g_hitSinkRegistered = true;
-            logger::info("[hit] TESHitEvent sink registered");
+
+            logger::info(
+                "[hit] TESHitEvent sink registered");
         }
 
         void V_HandleHealthDamage(
@@ -927,23 +703,29 @@ namespace UCA
                 return;
             }
 
-            const auto id = NextTraceID();
             const auto caller =
                 reinterpret_cast<std::uintptr_t>(
                     _ReturnAddress());
 
-            const auto before =
-                ReadHealth(a_self);
-
             logger::info(
-                "[vcall:{}] ENTER HandleHealthDamage "
-                "self=0x{:08X} attacker=0x{:08X} "
-                "input={} healthBefore={} tid={} caller={}",
-                id,
-                a_self ? a_self->GetFormID() : 0,
-                a_attacker ? a_attacker->GetFormID() : 0,
+                "[vcall:{}] HandleHealthDamage "
+                "selfPtr=0x{:X} "
+                "selfForm=0x{:08X} "
+                "attackerPtr=0x{:X} "
+                "attackerForm=0x{:08X} "
+                "input={} tid={} caller={}",
+                NextTraceID(),
+                reinterpret_cast<std::uintptr_t>(
+                    a_self),
+                a_self ?
+                    a_self->GetFormID() :
+                    0,
+                reinterpret_cast<std::uintptr_t>(
+                    a_attacker),
+                a_attacker ?
+                    a_attacker->GetFormID() :
+                    0,
                 a_damage,
-                before,
                 ::GetCurrentThreadId(),
                 FormatAddress(caller));
 
@@ -951,19 +733,6 @@ namespace UCA
                 a_self,
                 a_attacker,
                 a_damage);
-
-            const auto after =
-                ReadHealth(a_self);
-
-            logger::info(
-                "[vcall:{}] EXIT  HandleHealthDamage "
-                "self=0x{:08X} healthAfter={} "
-                "observedDelta={} dead={}",
-                id,
-                a_self ? a_self->GetFormID() : 0,
-                after,
-                after - before,
-                a_self ? a_self->IsDead() : false);
         }
 
         float V_CheckClampDamageModifier(
@@ -982,13 +751,28 @@ namespace UCA
                     a_delta);
             }
 
-            const auto id = NextTraceID();
+            const auto id =
+                NextTraceID();
+
             const auto caller =
                 reinterpret_cast<std::uintptr_t>(
                     _ReturnAddress());
 
-            const auto before =
-                ReadHealth(a_self);
+            logger::info(
+                "[vcall:{}] "
+                "CheckClampDamageModifier "
+                "selfPtr=0x{:X} "
+                "selfForm=0x{:08X} "
+                "input={} tid={} caller={}",
+                id,
+                reinterpret_cast<std::uintptr_t>(
+                    a_self),
+                a_self ?
+                    a_self->GetFormID() :
+                    0,
+                a_delta,
+                ::GetCurrentThreadId(),
+                FormatAddress(caller));
 
             const auto result =
                 g_vtablePrev.checkClamp(
@@ -996,338 +780,14 @@ namespace UCA
                     a_value,
                     a_delta);
 
-            const auto after =
-                ReadHealth(a_self);
-
             logger::info(
-                "[vcall:{}] CheckClampDamageModifier "
-                "self=0x{:08X} input={} result={} "
-                "healthBefore={} healthAfter={} "
-                "tid={} caller={}",
+                "[vcall:{}] "
+                "CheckClampDamageModifier "
+                "result={}",
                 id,
-                a_self ? a_self->GetFormID() : 0,
-                a_delta,
-                result,
-                before,
-                after,
-                ::GetCurrentThreadId(),
-                FormatAddress(caller));
+                result);
 
             return result;
-        }
-
-        void V_KillImpl(
-            RE::Actor* a_self,
-            RE::Actor* a_attacker,
-            float a_damage,
-            bool a_sendEvent,
-            bool a_ragdollInstant)
-        {
-            if (!g_vtablePrev.killImpl) {
-                return;
-            }
-
-            if (!g_config.traceLifecycle) {
-                g_vtablePrev.killImpl(
-                    a_self,
-                    a_attacker,
-                    a_damage,
-                    a_sendEvent,
-                    a_ragdollInstant);
-                return;
-            }
-
-            const auto id = NextTraceID();
-            const auto caller =
-                reinterpret_cast<std::uintptr_t>(
-                    _ReturnAddress());
-
-            const auto before =
-                ReadHealth(a_self);
-
-            logger::info(
-                "[vcall:{}] ENTER KillImpl "
-                "self=0x{:08X} attacker=0x{:08X} "
-                "damage={} healthBefore={} "
-                "sendEvent={} ragdoll={} tid={} caller={}",
-                id,
-                a_self ? a_self->GetFormID() : 0,
-                a_attacker ? a_attacker->GetFormID() : 0,
-                a_damage,
-                before,
-                a_sendEvent,
-                a_ragdollInstant,
-                ::GetCurrentThreadId(),
-                FormatAddress(caller));
-
-            g_vtablePrev.killImpl(
-                a_self,
-                a_attacker,
-                a_damage,
-                a_sendEvent,
-                a_ragdollInstant);
-
-            const auto after =
-                ReadHealth(a_self);
-
-            logger::info(
-                "[vcall:{}] EXIT  KillImpl "
-                "self=0x{:08X} healthAfter={} "
-                "observedDelta={} dead={}",
-                id,
-                a_self ? a_self->GetFormID() : 0,
-                after,
-                after - before,
-                a_self ? a_self->IsDead() : false);
-        }
-
-        void V_KillDying(RE::Actor* a_self)
-        {
-            if (!g_vtablePrev.killDying) {
-                return;
-            }
-
-            if (g_config.traceLifecycle) {
-                logger::info(
-                    "[vcall:{}] KillDying self=0x{:08X} "
-                    "health={} tid={} caller={}",
-                    NextTraceID(),
-                    a_self ? a_self->GetFormID() : 0,
-                    ReadHealth(a_self),
-                    ::GetCurrentThreadId(),
-                    FormatAddress(
-                        reinterpret_cast<std::uintptr_t>(
-                            _ReturnAddress())));
-            }
-
-            g_vtablePrev.killDying(a_self);
-        }
-
-        void V_Resurrect(
-            RE::Actor* a_self,
-            bool a_resetInventory,
-            bool a_attach3D)
-        {
-            if (!g_vtablePrev.resurrect) {
-                return;
-            }
-
-            if (g_config.traceLifecycle) {
-                logger::info(
-                    "[vcall:{}] Resurrect self=0x{:08X} "
-                    "health={} resetInventory={} attach3D={} "
-                    "tid={} caller={}",
-                    NextTraceID(),
-                    a_self ? a_self->GetFormID() : 0,
-                    ReadHealth(a_self),
-                    a_resetInventory,
-                    a_attach3D,
-                    ::GetCurrentThreadId(),
-                    FormatAddress(
-                        reinterpret_cast<std::uintptr_t>(
-                            _ReturnAddress())));
-            }
-
-            g_vtablePrev.resurrect(
-                a_self,
-                a_resetInventory,
-                a_attach3D);
-        }
-
-        void V_SetBaseActorValue(
-            RE::ActorValueOwner* a_self,
-            RE::ActorValue a_value,
-            float a_amount)
-        {
-            if (!g_vtablePrev.setBase) {
-                return;
-            }
-
-            if (a_value != RE::ActorValue::kHealth) {
-                g_vtablePrev.setBase(
-                    a_self,
-                    a_value,
-                    a_amount);
-                return;
-            }
-
-            const auto id = NextTraceID();
-            const auto caller =
-                reinterpret_cast<std::uintptr_t>(
-                    _ReturnAddress());
-
-            const auto before =
-                ReadHealth(a_self);
-
-            g_vtablePrev.setBase(
-                a_self,
-                a_value,
-                a_amount);
-
-            const auto after =
-                ReadHealth(a_self);
-
-            logger::info(
-                "[vcall:{}] SetBaseActorValue(Health) "
-                "avo=0x{:X} amount={} "
-                "healthBefore={} healthAfter={} "
-                "observedDelta={} tid={} caller={}",
-                id,
-                reinterpret_cast<std::uintptr_t>(a_self),
-                a_amount,
-                before,
-                after,
-                after - before,
-                ::GetCurrentThreadId(),
-                FormatAddress(caller));
-        }
-
-        void V_ModActorValue(
-            RE::ActorValueOwner* a_self,
-            RE::ActorValue a_value,
-            float a_amount)
-        {
-            if (!g_vtablePrev.modAV) {
-                return;
-            }
-
-            if (a_value != RE::ActorValue::kHealth) {
-                g_vtablePrev.modAV(
-                    a_self,
-                    a_value,
-                    a_amount);
-                return;
-            }
-
-            const auto id = NextTraceID();
-            const auto caller =
-                reinterpret_cast<std::uintptr_t>(
-                    _ReturnAddress());
-
-            const auto before =
-                ReadHealth(a_self);
-
-            g_vtablePrev.modAV(
-                a_self,
-                a_value,
-                a_amount);
-
-            const auto after =
-                ReadHealth(a_self);
-
-            logger::info(
-                "[vcall:{}] ModActorValue(Health) "
-                "avo=0x{:X} amount={} "
-                "healthBefore={} healthAfter={} "
-                "observedDelta={} tid={} caller={}",
-                id,
-                reinterpret_cast<std::uintptr_t>(a_self),
-                a_amount,
-                before,
-                after,
-                after - before,
-                ::GetCurrentThreadId(),
-                FormatAddress(caller));
-        }
-
-        void V_RestoreActorValue(
-            RE::ActorValueOwner* a_self,
-            RE::ACTOR_VALUE_MODIFIER a_modifier,
-            RE::ActorValue a_value,
-            float a_amount)
-        {
-            if (!g_vtablePrev.restoreAV) {
-                return;
-            }
-
-            if (a_value != RE::ActorValue::kHealth) {
-                g_vtablePrev.restoreAV(
-                    a_self,
-                    a_modifier,
-                    a_value,
-                    a_amount);
-                return;
-            }
-
-            const auto id = NextTraceID();
-            const auto caller =
-                reinterpret_cast<std::uintptr_t>(
-                    _ReturnAddress());
-
-            const auto before =
-                ReadHealth(a_self);
-
-            g_vtablePrev.restoreAV(
-                a_self,
-                a_modifier,
-                a_value,
-                a_amount);
-
-            const auto after =
-                ReadHealth(a_self);
-
-            logger::info(
-                "[vcall:{}] RestoreActorValue(Health) "
-                "avo=0x{:X} modifier={} amount={} "
-                "healthBefore={} healthAfter={} "
-                "observedDelta={} tid={} caller={}",
-                id,
-                reinterpret_cast<std::uintptr_t>(a_self),
-                static_cast<std::int32_t>(a_modifier),
-                a_amount,
-                before,
-                after,
-                after - before,
-                ::GetCurrentThreadId(),
-                FormatAddress(caller));
-        }
-
-        void V_SetActorValue(
-            RE::ActorValueOwner* a_self,
-            RE::ActorValue a_value,
-            float a_amount)
-        {
-            if (!g_vtablePrev.setAV) {
-                return;
-            }
-
-            if (a_value != RE::ActorValue::kHealth) {
-                g_vtablePrev.setAV(
-                    a_self,
-                    a_value,
-                    a_amount);
-                return;
-            }
-
-            const auto id = NextTraceID();
-            const auto caller =
-                reinterpret_cast<std::uintptr_t>(
-                    _ReturnAddress());
-
-            const auto before =
-                ReadHealth(a_self);
-
-            g_vtablePrev.setAV(
-                a_self,
-                a_value,
-                a_amount);
-
-            const auto after =
-                ReadHealth(a_self);
-
-            logger::info(
-                "[vcall:{}] SetActorValue(Health) "
-                "avo=0x{:X} amount={} "
-                "healthBefore={} healthAfter={} "
-                "observedDelta={} tid={} caller={}",
-                id,
-                reinterpret_cast<std::uintptr_t>(a_self),
-                a_amount,
-                before,
-                after,
-                after - before,
-                ::GetCurrentThreadId(),
-                FormatAddress(caller));
         }
 
         void E_HandleHealthDamage(
@@ -1339,23 +799,29 @@ namespace UCA
                 return;
             }
 
-            const auto id = NextTraceID();
             const auto caller =
                 reinterpret_cast<std::uintptr_t>(
                     _ReturnAddress());
 
-            const auto before =
-                ReadHealth(a_self);
-
             logger::info(
-                "[entry:{}] ENTER HandleHealthDamage "
-                "self=0x{:08X} attacker=0x{:08X} "
-                "input={} healthBefore={} tid={} caller={}",
-                id,
-                a_self ? a_self->GetFormID() : 0,
-                a_attacker ? a_attacker->GetFormID() : 0,
+                "[entry:{}] HandleHealthDamage "
+                "selfPtr=0x{:X} "
+                "selfForm=0x{:08X} "
+                "attackerPtr=0x{:X} "
+                "attackerForm=0x{:08X} "
+                "input={} tid={} caller={}",
+                NextTraceID(),
+                reinterpret_cast<std::uintptr_t>(
+                    a_self),
+                a_self ?
+                    a_self->GetFormID() :
+                    0,
+                reinterpret_cast<std::uintptr_t>(
+                    a_attacker),
+                a_attacker ?
+                    a_attacker->GetFormID() :
+                    0,
                 a_damage,
-                before,
                 ::GetCurrentThreadId(),
                 FormatAddress(caller));
 
@@ -1363,19 +829,6 @@ namespace UCA
                 a_self,
                 a_attacker,
                 a_damage);
-
-            const auto after =
-                ReadHealth(a_self);
-
-            logger::info(
-                "[entry:{}] EXIT  HandleHealthDamage "
-                "self=0x{:08X} healthAfter={} "
-                "observedDelta={} dead={}",
-                id,
-                a_self ? a_self->GetFormID() : 0,
-                after,
-                after - before,
-                a_self ? a_self->IsDead() : false);
         }
 
         float E_CheckClampDamageModifier(
@@ -1394,13 +847,28 @@ namespace UCA
                     a_delta);
             }
 
-            const auto id = NextTraceID();
+            const auto id =
+                NextTraceID();
+
             const auto caller =
                 reinterpret_cast<std::uintptr_t>(
                     _ReturnAddress());
 
-            const auto before =
-                ReadHealth(a_self);
+            logger::info(
+                "[entry:{}] "
+                "CheckClampDamageModifier "
+                "selfPtr=0x{:X} "
+                "selfForm=0x{:08X} "
+                "input={} tid={} caller={}",
+                id,
+                reinterpret_cast<std::uintptr_t>(
+                    a_self),
+                a_self ?
+                    a_self->GetFormID() :
+                    0,
+                a_delta,
+                ::GetCurrentThreadId(),
+                FormatAddress(caller));
 
             const auto result =
                 g_entryOriginal.checkClamp(
@@ -1408,474 +876,22 @@ namespace UCA
                     a_value,
                     a_delta);
 
-            const auto after =
-                ReadHealth(a_self);
-
             logger::info(
-                "[entry:{}] CheckClampDamageModifier "
-                "self=0x{:08X} input={} result={} "
-                "healthBefore={} healthAfter={} "
-                "tid={} caller={}",
+                "[entry:{}] "
+                "CheckClampDamageModifier "
+                "result={}",
                 id,
-                a_self ? a_self->GetFormID() : 0,
-                a_delta,
-                result,
-                before,
-                after,
-                ::GetCurrentThreadId(),
-                FormatAddress(caller));
+                result);
 
             return result;
         }
 
-        void E_KillImpl(
-            RE::Actor* a_self,
-            RE::Actor* a_attacker,
-            float a_damage,
-            bool a_sendEvent,
-            bool a_ragdollInstant)
+        void InstallTracingOnce()
         {
-            if (!g_entryOriginal.killImpl) {
+            if (g_tracingInstalled) {
                 return;
             }
 
-            const auto id = NextTraceID();
-            const auto caller =
-                reinterpret_cast<std::uintptr_t>(
-                    _ReturnAddress());
-
-            const auto before =
-                ReadHealth(a_self);
-
-            logger::info(
-                "[entry:{}] ENTER KillImpl "
-                "self=0x{:08X} attacker=0x{:08X} "
-                "damage={} healthBefore={} "
-                "sendEvent={} ragdoll={} tid={} caller={}",
-                id,
-                a_self ? a_self->GetFormID() : 0,
-                a_attacker ? a_attacker->GetFormID() : 0,
-                a_damage,
-                before,
-                a_sendEvent,
-                a_ragdollInstant,
-                ::GetCurrentThreadId(),
-                FormatAddress(caller));
-
-            g_entryOriginal.killImpl(
-                a_self,
-                a_attacker,
-                a_damage,
-                a_sendEvent,
-                a_ragdollInstant);
-
-            const auto after =
-                ReadHealth(a_self);
-
-            logger::info(
-                "[entry:{}] EXIT  KillImpl "
-                "self=0x{:08X} healthAfter={} "
-                "observedDelta={} dead={}",
-                id,
-                a_self ? a_self->GetFormID() : 0,
-                after,
-                after - before,
-                a_self ? a_self->IsDead() : false);
-        }
-
-        void E_ModActorValue(
-            RE::ActorValueOwner* a_self,
-            RE::ActorValue a_value,
-            float a_amount)
-        {
-            if (!g_entryOriginal.modAV) {
-                return;
-            }
-
-            if (a_value != RE::ActorValue::kHealth) {
-                g_entryOriginal.modAV(
-                    a_self,
-                    a_value,
-                    a_amount);
-                return;
-            }
-
-            const auto id = NextTraceID();
-            const auto caller =
-                reinterpret_cast<std::uintptr_t>(
-                    _ReturnAddress());
-
-            const auto before =
-                ReadHealth(a_self);
-
-            logger::info(
-                "[entry:{}] ENTER ModActorValue(Health) "
-                "avo=0x{:X} amount={} healthBefore={} "
-                "tid={} caller={}",
-                id,
-                reinterpret_cast<std::uintptr_t>(a_self),
-                a_amount,
-                before,
-                ::GetCurrentThreadId(),
-                FormatAddress(caller));
-
-            g_entryOriginal.modAV(
-                a_self,
-                a_value,
-                a_amount);
-
-            const auto after =
-                ReadHealth(a_self);
-
-            logger::info(
-                "[entry:{}] EXIT  ModActorValue(Health) "
-                "avo=0x{:X} healthAfter={} observedDelta={}",
-                id,
-                reinterpret_cast<std::uintptr_t>(a_self),
-                after,
-                after - before);
-        }
-
-        void E_RestoreActorValue(
-            RE::ActorValueOwner* a_self,
-            RE::ACTOR_VALUE_MODIFIER a_modifier,
-            RE::ActorValue a_value,
-            float a_amount)
-        {
-            if (!g_entryOriginal.restoreAV) {
-                return;
-            }
-
-            if (a_value != RE::ActorValue::kHealth) {
-                g_entryOriginal.restoreAV(
-                    a_self,
-                    a_modifier,
-                    a_value,
-                    a_amount);
-                return;
-            }
-
-            const auto id = NextTraceID();
-            const auto caller =
-                reinterpret_cast<std::uintptr_t>(
-                    _ReturnAddress());
-
-            const auto before =
-                ReadHealth(a_self);
-
-            logger::info(
-                "[entry:{}] ENTER RestoreActorValue(Health) "
-                "avo=0x{:X} modifier={} amount={} "
-                "healthBefore={} tid={} caller={}",
-                id,
-                reinterpret_cast<std::uintptr_t>(a_self),
-                static_cast<std::int32_t>(a_modifier),
-                a_amount,
-                before,
-                ::GetCurrentThreadId(),
-                FormatAddress(caller));
-
-            g_entryOriginal.restoreAV(
-                a_self,
-                a_modifier,
-                a_value,
-                a_amount);
-
-            const auto after =
-                ReadHealth(a_self);
-
-            logger::info(
-                "[entry:{}] EXIT  RestoreActorValue(Health) "
-                "avo=0x{:X} healthAfter={} observedDelta={}",
-                id,
-                reinterpret_cast<std::uintptr_t>(a_self),
-                after,
-                after - before);
-        }
-
-        void E_SetActorValue(
-            RE::ActorValueOwner* a_self,
-            RE::ActorValue a_value,
-            float a_amount)
-        {
-            if (!g_entryOriginal.setAV) {
-                return;
-            }
-
-            if (a_value != RE::ActorValue::kHealth) {
-                g_entryOriginal.setAV(
-                    a_self,
-                    a_value,
-                    a_amount);
-                return;
-            }
-
-            const auto id = NextTraceID();
-            const auto caller =
-                reinterpret_cast<std::uintptr_t>(
-                    _ReturnAddress());
-
-            const auto before =
-                ReadHealth(a_self);
-
-            logger::info(
-                "[entry:{}] ENTER SetActorValue(Health) "
-                "avo=0x{:X} amount={} healthBefore={} "
-                "tid={} caller={}",
-                id,
-                reinterpret_cast<std::uintptr_t>(a_self),
-                a_amount,
-                before,
-                ::GetCurrentThreadId(),
-                FormatAddress(caller));
-
-            g_entryOriginal.setAV(
-                a_self,
-                a_value,
-                a_amount);
-
-            const auto after =
-                ReadHealth(a_self);
-
-            logger::info(
-                "[entry:{}] EXIT  SetActorValue(Health) "
-                "avo=0x{:X} healthAfter={} observedDelta={}",
-                id,
-                reinterpret_cast<std::uintptr_t>(a_self),
-                after,
-                after - before);
-        }
-
-        std::uintptr_t DiscoverLiveActorAVOVTable()
-        {
-            auto* player =
-                RE::PlayerCharacter::GetSingleton();
-
-            auto* avo =
-                player ?
-                    player->AsActorValueOwner() :
-                    nullptr;
-
-            if (!player || !avo) {
-                return 0;
-            }
-
-            g_actorToAVOOffset =
-                static_cast<std::intptr_t>(
-                    reinterpret_cast<std::uintptr_t>(avo) -
-                    reinterpret_cast<std::uintptr_t>(player));
-
-            return *reinterpret_cast<
-                const std::uintptr_t*>(avo);
-        }
-
-        void ResolveActorTargets(
-            std::uintptr_t a_actorVTable)
-        {
-            if (!g_targets.handleHealth) {
-                g_targets.handleHealth =
-                    g_pristine.ResolveVFunc(
-                        a_actorVTable,
-                        kActor_HandleHealthDamage);
-
-                g_targets.killImpl =
-                    g_pristine.ResolveVFunc(
-                        a_actorVTable,
-                        kActor_KillImpl);
-
-                g_targets.checkClamp =
-                    g_pristine.ResolveVFunc(
-                        a_actorVTable,
-                        kActor_CheckClampDamageModifier);
-            }
-        }
-
-        void ResolveAVOTargets(
-            std::uintptr_t a_liveAVOVTable)
-        {
-            if (!g_targets.setBase) {
-                g_targets.setBase =
-                    g_pristine.ResolveVFunc(
-                        a_liveAVOVTable,
-                        kAVO_SetBaseActorValue);
-
-                g_targets.modAV =
-                    g_pristine.ResolveVFunc(
-                        a_liveAVOVTable,
-                        kAVO_ModActorValue);
-
-                g_targets.restoreAV =
-                    g_pristine.ResolveVFunc(
-                        a_liveAVOVTable,
-                        kAVO_RestoreActorValue);
-
-                g_targets.setAV =
-                    g_pristine.ResolveVFunc(
-                        a_liveAVOVTable,
-                        kAVO_SetActorValue);
-            }
-        }
-
-        void InstallActorEntryHooks()
-        {
-            if (!g_config.traceEntryCalls ||
-                !g_runtime1170) {
-                return;
-            }
-
-            InstallEntryHook(
-                "Skyrim::Actor::HandleHealthDamage",
-                g_targets.handleHealth,
-                E_HandleHealthDamage,
-                g_entryOriginal.handleHealth,
-                { 0x48, 0x89, 0x5C, 0x24, 0x08 });
-
-            InstallEntryHook(
-                "Skyrim::Actor::CheckClampDamageModifier",
-                g_targets.checkClamp,
-                E_CheckClampDamageModifier,
-                g_entryOriginal.checkClamp,
-                { 0x48, 0x89, 0x5C, 0x24, 0x08 });
-
-            InstallEntryHook(
-                "Skyrim::Actor::KillImpl",
-                g_targets.killImpl,
-                E_KillImpl,
-                g_entryOriginal.killImpl,
-                { 0x48, 0x8B, 0xC4,
-                  0x44, 0x88, 0x48, 0x20 });
-        }
-
-        void InstallAVOEntryHooks()
-        {
-            if (!g_config.traceEntryCalls ||
-                !g_runtime1170) {
-                return;
-            }
-
-            if (g_targets.setBase) {
-                logger::info(
-                    "[entry-install] Skyrim::ActorValueOwner::SetBaseActorValue "
-                    "target={} entry hook intentionally skipped; "
-                    "vtable tracing remains active",
-                    FormatAddress(g_targets.setBase));
-            }
-
-            InstallEntryHook(
-                "Skyrim::ActorValueOwner::ModActorValue",
-                g_targets.modAV,
-                E_ModActorValue,
-                g_entryOriginal.modAV,
-                { 0x48, 0x89, 0x5C, 0x24, 0x08 });
-
-            InstallEntryHook(
-                "Skyrim::ActorValueOwner::RestoreActorValue",
-                g_targets.restoreAV,
-                E_RestoreActorValue,
-                g_entryOriginal.restoreAV,
-                { 0x48, 0x83, 0xEC, 0x38,
-                  0x48, 0x81, 0xC1, 0x48,
-                  0xFF, 0xFF, 0xFF });
-
-            InstallEntryHook(
-                "Skyrim::ActorValueOwner::SetActorValue",
-                g_targets.setAV,
-                E_SetActorValue,
-                g_entryOriginal.setAV,
-                { 0x48, 0x8B, 0x01,
-                  0x48, 0xFF, 0x60, 0x20 });
-        }
-
-        void DescribeActorLayout(
-            std::uintptr_t a_actorVTable)
-        {
-            static bool done = false;
-            if (done) {
-                return;
-            }
-            done = true;
-
-            logger::info(
-                "[layout] Actor primary vtable=0x{:X}",
-                a_actorVTable);
-
-            DescribeVTableSlot(
-                "Actor::HandleHealthDamage",
-                a_actorVTable,
-                kActor_HandleHealthDamage);
-
-            DescribeVTableSlot(
-                "Actor::KillImpl",
-                a_actorVTable,
-                kActor_KillImpl);
-
-            DescribeVTableSlot(
-                "Actor::CheckClampDamageModifier",
-                a_actorVTable,
-                kActor_CheckClampDamageModifier);
-
-            DescribeVTableSlot(
-                "Actor::KillDying",
-                a_actorVTable,
-                kActor_KillDying);
-
-            DescribeVTableSlot(
-                "Actor::Resurrect",
-                a_actorVTable,
-                kActor_Resurrect);
-        }
-
-        void DescribeAVOLayout(
-            std::uintptr_t a_liveAVOVTable)
-        {
-            static bool done = false;
-            if (done || !a_liveAVOVTable) {
-                return;
-            }
-            done = true;
-
-            static REL::Relocation<std::uintptr_t>
-                canonicalAVO{
-                    RE::VTABLE_ActorValueOwner[0]
-                };
-
-            logger::info(
-                "[layout] canonical ActorValueOwner vtable=0x{:X}; "
-                "live Actor::ActorValueOwner vtable=0x{:X}; "
-                "actorToAVOOffset=0x{:X}",
-                canonicalAVO.address(),
-                a_liveAVOVTable,
-                static_cast<std::uintptr_t>(
-                    g_actorToAVOOffset));
-
-            DescribeVTableSlot(
-                "ActorValueOwner::GetActorValue",
-                a_liveAVOVTable,
-                kAVO_GetActorValue);
-
-            DescribeVTableSlot(
-                "ActorValueOwner::SetBaseActorValue",
-                a_liveAVOVTable,
-                kAVO_SetBaseActorValue);
-
-            DescribeVTableSlot(
-                "ActorValueOwner::ModActorValue",
-                a_liveAVOVTable,
-                kAVO_ModActorValue);
-
-            DescribeVTableSlot(
-                "ActorValueOwner::RestoreActorValue",
-                a_liveAVOVTable,
-                kAVO_RestoreActorValue);
-
-            DescribeVTableSlot(
-                "ActorValueOwner::SetActorValue",
-                a_liveAVOVTable,
-                kAVO_SetActorValue);
-        }
-
-        bool InstallOrRefreshTracing()
-        {
             static REL::Relocation<std::uintptr_t>
                 actorVTable{
                     RE::VTABLE_Actor[0]
@@ -1884,101 +900,60 @@ namespace UCA
             const auto actorVT =
                 actorVTable.address();
 
-            ResolveActorTargets(actorVT);
-            DescribeActorLayout(actorVT);
+            logger::info(
+                "[layout] Actor primary vtable=0x{:X}",
+                actorVT);
 
-            EnsureVTableHook(
+            DescribeVTableSlot(
+                "Actor::HandleHealthDamage",
+                actorVT,
+                kActor_HandleHealthDamage);
+
+            DescribeVTableSlot(
+                "Actor::CheckClampDamageModifier",
+                actorVT,
+                kActor_CheckClampDamageModifier);
+
+            g_targets.handleHealth =
+                g_pristine.ResolveVFunc(
+                    actorVT,
+                    kActor_HandleHealthDamage);
+
+            g_targets.checkClamp =
+                g_pristine.ResolveVFunc(
+                    actorVT,
+                    kActor_CheckClampDamageModifier);
+
+            InstallVTableHookOnce(
                 actorVT,
                 kActor_HandleHealthDamage,
                 V_HandleHealthDamage,
                 g_vtablePrev.handleHealth,
                 "Actor::HandleHealthDamage");
 
-            EnsureVTableHook(
-                actorVT,
-                kActor_KillImpl,
-                V_KillImpl,
-                g_vtablePrev.killImpl,
-                "Actor::KillImpl");
-
-            EnsureVTableHook(
+            InstallVTableHookOnce(
                 actorVT,
                 kActor_CheckClampDamageModifier,
                 V_CheckClampDamageModifier,
                 g_vtablePrev.checkClamp,
                 "Actor::CheckClampDamageModifier");
 
-            EnsureVTableHook(
-                actorVT,
-                kActor_KillDying,
-                V_KillDying,
-                g_vtablePrev.killDying,
-                "Actor::KillDying");
+            InstallFiveByteEntryHook(
+                "Skyrim::Actor::HandleHealthDamage",
+                g_targets.handleHealth,
+                E_HandleHealthDamage,
+                g_entryOriginal.handleHealth);
 
-            EnsureVTableHook(
-                actorVT,
-                kActor_Resurrect,
-                V_Resurrect,
-                g_vtablePrev.resurrect,
-                "Actor::Resurrect");
+            InstallFiveByteEntryHook(
+                "Skyrim::Actor::CheckClampDamageModifier",
+                g_targets.checkClamp,
+                E_CheckClampDamageModifier,
+                g_entryOriginal.checkClamp);
 
-            InstallActorEntryHooks();
+            g_tracingInstalled = true;
 
-            const auto liveAVOVT =
-                DiscoverLiveActorAVOVTable();
-
-            if (!liveAVOVT) {
-                logger::info(
-                    "[layout] live Actor::ActorValueOwner "
-                    "vtable unavailable; AVO tracing deferred");
-                return true;
-            }
-
-            if (g_liveActorAVOVTable != 0 &&
-                g_liveActorAVOVTable != liveAVOVT) {
-                logger::warn(
-                    "[layout] live Actor::ActorValueOwner vtable "
-                    "changed from 0x{:X} to 0x{:X}",
-                    g_liveActorAVOVTable,
-                    liveAVOVT);
-            }
-
-            g_liveActorAVOVTable =
-                liveAVOVT;
-
-            ResolveAVOTargets(liveAVOVT);
-            DescribeAVOLayout(liveAVOVT);
-            InstallAVOEntryHooks();
-
-            EnsureVTableHook(
-                liveAVOVT,
-                kAVO_SetBaseActorValue,
-                V_SetBaseActorValue,
-                g_vtablePrev.setBase,
-                "ActorValueOwner::SetBaseActorValue");
-
-            EnsureVTableHook(
-                liveAVOVT,
-                kAVO_ModActorValue,
-                V_ModActorValue,
-                g_vtablePrev.modAV,
-                "ActorValueOwner::ModActorValue");
-
-            EnsureVTableHook(
-                liveAVOVT,
-                kAVO_RestoreActorValue,
-                V_RestoreActorValue,
-                g_vtablePrev.restoreAV,
-                "ActorValueOwner::RestoreActorValue");
-
-            EnsureVTableHook(
-                liveAVOVT,
-                kAVO_SetActorValue,
-                V_SetActorValue,
-                g_vtablePrev.setAV,
-                "ActorValueOwner::SetActorValue");
-
-            return true;
+            logger::info(
+                "PoC3.1 Safe Trace installed");
         }
 
         void SetupLog()
@@ -2004,8 +979,11 @@ namespace UCA
                     "global",
                     std::move(sink));
 
-            log->set_level(spdlog::level::debug);
-            log->flush_on(spdlog::level::debug);
+            log->set_level(
+                spdlog::level::debug);
+
+            log->flush_on(
+                spdlog::level::debug);
 
             spdlog::set_default_logger(
                 std::move(log));
@@ -2022,34 +1000,15 @@ namespace UCA
             }
 
             switch (a_message->type) {
-            case SKSE::MessagingInterface::kPostPostLoad:
-                InstallOrRefreshTracing();
-                break;
-
             case SKSE::MessagingInterface::kDataLoaded:
                 RegisterHitEventSink();
-                InstallOrRefreshTracing();
-
-                if (auto* tasks =
-                        SKSE::GetTaskInterface()) {
-                    tasks->AddTask(
-                        []() {
-                            RegisterHitEventSink();
-                            InstallOrRefreshTracing();
-                        });
-                }
+                InstallTracingOnce();
                 break;
 
             case SKSE::MessagingInterface::kPostLoadGame:
             case SKSE::MessagingInterface::kNewGame:
-                if (auto* tasks =
-                        SKSE::GetTaskInterface()) {
-                    tasks->AddTask(
-                        []() {
-                            RegisterHitEventSink();
-                            InstallOrRefreshTracing();
-                        });
-                }
+                // One-shot by design. Do not reinstall hooks later.
+                RegisterHitEventSink();
                 break;
 
             default:
@@ -2070,27 +1029,28 @@ namespace UCA
             runtimeString == "1-6-1170-0";
 
         logger::info(
-            "UniversalCombatArbiter PoC3 "
-            "Hit Event + Function Entry Tracer loading; runtime {}",
+            "UniversalCombatArbiter "
+            "PoC3.1 Safe Trace loading; runtime {}",
             runtimeString);
 
         LoadConfig();
 
         if (!g_runtime1170) {
             logger::warn(
-                "PoC3 entry-detour prologues are verified only for "
-                "Skyrim 1.6.1170. Vtable and hit-event tracing will "
-                "still run, but engine-entry detours are disabled.");
+                "Engine-entry tracing is enabled "
+                "only on Skyrim 1.6.1170");
         }
 
         if (!g_pristine.Load()) {
             logger::critical(
-                "Failed to read Skyrim executable for pristine "
-                "vtable recovery; tracer disabled");
+                "Failed to read Skyrim executable "
+                "for vtable recovery; plugin disabled");
+
             return true;
         }
 
-        SKSE::AllocTrampoline(1u << 12);
+        SKSE::AllocTrampoline(
+            1u << 10);
 
         auto* messaging =
             SKSE::GetMessagingInterface();
@@ -2098,8 +1058,11 @@ namespace UCA
         if (!messaging ||
             !messaging->RegisterListener(
                 MessageHandler)) {
+
             logger::critical(
-                "Could not register SKSE message listener");
+                "Could not register "
+                "SKSE message listener");
+
             return false;
         }
 
@@ -2111,5 +1074,7 @@ SKSEPluginLoad(
     const SKSE::LoadInterface* a_skse)
 {
     SKSE::Init(a_skse);
-    return UCA::Initialize(a_skse);
+
+    return UCA::Initialize(
+        a_skse);
 }
