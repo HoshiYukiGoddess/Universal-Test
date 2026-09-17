@@ -87,6 +87,16 @@ jobs:
           Copy-Item $dll.FullName `
             "$out/UniversalCombatArbiter.dll"
 
+          $fmt = Get-ChildItem build -Recurse -Filter fmt.dll | Select-Object -First 1
+          if ($fmt) {
+            Copy-Item $fmt.FullName "$out/fmt.dll"
+          }
+
+          $spdlog = Get-ChildItem build -Recurse -Filter spdlog.dll | Select-Object -First 1
+          if ($spdlog) {
+            Copy-Item $spdlog.FullName "$out/spdlog.dll"
+          }
+
           Copy-Item `
             "config/UniversalCombatArbiter.ini" `
             "$out/UniversalCombatArbiter.ini"
