@@ -12,13 +12,13 @@ namespace UCA
         constexpr std::size_t kAVO_GetActorValue = 0x01;
         constexpr std::size_t kAVO_ModActorValue = 0x05;
         constexpr std::size_t kActor_KillImpl = 0x10E;
+        constexpr std::size_t kIntegrityBytes = 32;
 
         struct Config
         {
             bool playerHasAbsoluteDamage{ true };
             bool logHealth{ true };
-            bool attemptVanillaKillImpl{ true };
-            bool bypassEssentialGate{ true };
+            bool logKillIntegrity{ true };
             float directDamage{ 1000.0F };
             std::uint32_t cooldownMs{ 250 };
         };
@@ -117,14 +117,9 @@ namespace UCA
                     "bLogDirectHealth",
                     true);
 
-            g_config.attemptVanillaKillImpl =
+            g_config.logKillIntegrity =
                 ReadIniBool(
-                    "bAttemptVanillaKillImpl",
-                    true);
-
-            g_config.bypassEssentialGate =
-                ReadIniBool(
-                    "bBypassEssentialGate",
+                    "bLogKillIntegrity",
                     true);
 
             g_config.directDamage =
@@ -143,13 +138,12 @@ namespace UCA
                     5000u);
 
             logger::info(
-                "Essential-Gate PoC config: player={}, damage={}, cooldown={}ms, logHealth={}, killImpl={}, bypassEssential={}",
+                "Kill-Integrity PoC config: player={}, damage={}, cooldown={}ms, logHealth={}, integrity={}",
                 g_config.playerHasAbsoluteDamage,
                 g_config.directDamage,
                 g_config.cooldownMs,
                 g_config.logHealth,
-                g_config.attemptVanillaKillImpl,
-                g_config.bypassEssentialGate);
+                g_config.logKillIntegrity);
         }
 
         struct AddressInfo
@@ -432,6 +426,46 @@ namespace UCA
                            _preferredBase);
             }
 
+            [[nodiscard]]
+            bool ReadRuntimeMappedBytes(
+                std::uintptr_t a_runtimeAddress,
+                void* a_output,
+                std::size_t a_count) const
+            {
+                if (!_runtimeBase ||
+                    _bytes.empty() ||
+                    !a_output ||
+                    a_count == 0 ||
+                    a_runtimeAddress <
+                        _runtimeBase) {
+
+                    return false;
+                }
+
+                const auto rva =
+                    a_runtimeAddress -
+                    _runtimeBase;
+
+                const auto fileOffset =
+                    RvaToFileOffset(
+                        rva);
+
+                if (!fileOffset ||
+                    *fileOffset + a_count >
+                        _bytes.size()) {
+
+                    return false;
+                }
+
+                std::memcpy(
+                    a_output,
+                    _bytes.data() +
+                        *fileOffset,
+                    a_count);
+
+                return true;
+            }
+
         private:
             [[nodiscard]]
             std::optional<std::size_t>
@@ -500,17 +534,13 @@ namespace UCA
                 RE::ActorValue,
                 float);
 
-        using KillImpl_t =
-            void (*)(
-                RE::Actor*,
-                RE::Actor*,
-                float,
-                bool,
-                bool);
-
         GetActorValue_t g_vanillaGetActorValue{};
         ModActorValue_t g_vanillaModActorValue{};
-        KillImpl_t g_vanillaKillImpl{};
+
+        std::uintptr_t g_killImplCurrent{};
+        std::uintptr_t g_killImplPristine{};
+        bool g_killImplBytesEqual{ false };
+        bool g_integrityResolved{ false };
 
         bool g_bypassReady{ false };
         bool g_hitSinkRegistered{ false };
@@ -519,10 +549,6 @@ namespace UCA
         std::unordered_map<
             RE::FormID,
             ULONGLONG> g_lastHitByTarget;
-
-        std::unordered_map<
-            RE::FormID,
-            bool> g_killAttemptedByTarget;
 
         bool ShouldQueueTarget(
             RE::FormID a_formID)
@@ -565,6 +591,273 @@ namespace UCA
             return true;
         }
 
+        template <std::size_t N>
+        std::string FormatBytes(
+            const std::array<std::uint8_t, N>& a_bytes,
+            std::size_t a_count = N)
+        {
+            const auto count =
+                std::min<std::size_t>(
+                    a_count,
+                    N);
+
+            std::string out;
+            out.reserve(
+                count * 3);
+
+            for (std::size_t i = 0;
+                 i < count;
+                 ++i) {
+
+                if (i != 0) {
+                    out += ' ';
+                }
+
+                out += fmt::format(
+                    "{:02X}",
+                    a_bytes[i]);
+            }
+
+            return out;
+        }
+
+        std::string DescribeEntryTransfer(
+            std::uintptr_t a_address,
+            const std::array<
+                std::uint8_t,
+                kIntegrityBytes>& a_bytes)
+        {
+            // E9 rel32
+            if (a_bytes[0] == 0xE9) {
+                std::int32_t rel = 0;
+
+                std::memcpy(
+                    &rel,
+                    a_bytes.data() + 1,
+                    sizeof(rel));
+
+                const auto target =
+                    static_cast<std::uintptr_t>(
+                        static_cast<std::intptr_t>(
+                            a_address + 5) +
+                        static_cast<std::intptr_t>(
+                            rel));
+
+                return fmt::format(
+                    "E9->{}",
+                    FormatAddress(
+                        target));
+            }
+
+            // FF 25 rel32  => jmp qword ptr [rip+rel32]
+            if (a_bytes[0] == 0xFF &&
+                a_bytes[1] == 0x25) {
+
+                std::int32_t rel = 0;
+
+                std::memcpy(
+                    &rel,
+                    a_bytes.data() + 2,
+                    sizeof(rel));
+
+                const auto slot =
+                    static_cast<std::uintptr_t>(
+                        static_cast<std::intptr_t>(
+                            a_address + 6) +
+                        static_cast<std::intptr_t>(
+                            rel));
+
+                std::uintptr_t target = 0;
+
+                MEMORY_BASIC_INFORMATION mbi{};
+
+                if (::VirtualQuery(
+                        reinterpret_cast<
+                            const void*>(
+                                slot),
+                        &mbi,
+                        sizeof(mbi)) != 0 &&
+                    mbi.State == MEM_COMMIT &&
+                    (mbi.Protect &
+                     (PAGE_NOACCESS |
+                      PAGE_GUARD)) == 0) {
+
+                    target =
+                        *reinterpret_cast<
+                            const std::uintptr_t*>(
+                                slot);
+                }
+
+                if (target) {
+                    return fmt::format(
+                        "FF25 slot=0x{:X}->{}",
+                        slot,
+                        FormatAddress(
+                            target));
+                }
+
+                return fmt::format(
+                    "FF25 slot=0x{:X}",
+                    slot);
+            }
+
+            return "<no-obvious-entry-jump>";
+        }
+
+        void ResolveKillImplIntegrity()
+        {
+            if (g_integrityResolved ||
+                !g_config.logKillIntegrity) {
+
+                return;
+            }
+
+            static REL::Relocation<
+                std::uintptr_t>
+                actorVTable{
+                    RE::VTABLE_Actor[0]
+                };
+
+            const auto actorVT =
+                actorVTable.address();
+
+            if (!actorVT) {
+                logger::warn(
+                    "[kill-integrity] Actor vtable unavailable");
+                return;
+            }
+
+            g_killImplCurrent =
+                *reinterpret_cast<
+                    const std::uintptr_t*>(
+                        actorVT +
+                        kActor_KillImpl *
+                            sizeof(void*));
+
+            g_killImplPristine =
+                g_pristine.ResolveVFunc(
+                    actorVT,
+                    kActor_KillImpl);
+
+            if (!g_killImplCurrent ||
+                !g_killImplPristine) {
+
+                logger::warn(
+                    "[kill-integrity] could not resolve KillImpl current/pristine addresses");
+                return;
+            }
+
+            std::array<
+                std::uint8_t,
+                kIntegrityBytes>
+                runtimeBytes{};
+
+            std::array<
+                std::uint8_t,
+                kIntegrityBytes>
+                diskBytes{};
+
+            std::memcpy(
+                runtimeBytes.data(),
+                reinterpret_cast<
+                    const void*>(
+                        g_killImplCurrent),
+                runtimeBytes.size());
+
+            const bool diskOK =
+                g_pristine.ReadRuntimeMappedBytes(
+                    g_killImplPristine,
+                    diskBytes.data(),
+                    diskBytes.size());
+
+            g_killImplBytesEqual =
+                diskOK &&
+                runtimeBytes ==
+                    diskBytes;
+
+            logger::info(
+                "[kill-integrity] Actor vtable=0x{:X}[0x{:X}] current={} pristine={} sameAddress={}",
+                actorVT,
+                kActor_KillImpl,
+                FormatAddress(
+                    g_killImplCurrent),
+                FormatAddress(
+                    g_killImplPristine),
+                g_killImplCurrent ==
+                    g_killImplPristine);
+
+            logger::info(
+                "[kill-integrity] runtime32=[{}]",
+                FormatBytes(
+                    runtimeBytes));
+
+            if (diskOK) {
+                logger::info(
+                    "[kill-integrity] disk32=[{}]",
+                    FormatBytes(
+                        diskBytes));
+
+                logger::info(
+                    "[kill-integrity] bytesEqual={} entryTransfer={}",
+                    g_killImplBytesEqual,
+                    DescribeEntryTransfer(
+                        g_killImplCurrent,
+                        runtimeBytes));
+            } else {
+                logger::warn(
+                    "[kill-integrity] disk byte mapping failed");
+            }
+
+            g_integrityResolved = true;
+        }
+
+        struct ProtectionSources
+        {
+            bool runtimeEssential{};
+            bool runtimeProtected{};
+            bool baseEssential{};
+            bool baseProtected{};
+            RE::FormID baseForm{};
+        };
+
+        ProtectionSources ReadProtectionSources(
+            RE::Actor* a_actor)
+        {
+            ProtectionSources result{};
+
+            if (!a_actor) {
+                return result;
+            }
+
+            result.runtimeEssential =
+                a_actor->IsEssential();
+
+            result.runtimeProtected =
+                a_actor->IsProtected();
+
+            auto* base =
+                a_actor->GetActorBase();
+
+            if (!base) {
+                return result;
+            }
+
+            result.baseForm =
+                base->GetFormID();
+
+            result.baseEssential =
+                base->actorData.actorBaseFlags.any(
+                    RE::ACTOR_BASE_DATA::Flag::
+                        kEssential);
+
+            result.baseProtected =
+                base->actorData.actorBaseFlags.any(
+                    RE::ACTOR_BASE_DATA::Flag::
+                        kProtected);
+
+            return result;
+        }
+
         std::uint32_t GetLifeStateRaw(
             RE::Actor* a_actor)
         {
@@ -581,108 +874,6 @@ namespace UCA
 
             return static_cast<std::uint32_t>(
                 state->GetLifeState());
-        }
-
-        bool IsDyingOrDead(
-            RE::Actor* a_actor)
-        {
-            if (!a_actor) {
-                return true;
-            }
-
-            auto* state =
-                a_actor->AsActorState();
-
-            if (!state) {
-                return false;
-            }
-
-            const auto life =
-                state->GetLifeState();
-
-            return life ==
-                       RE::ACTOR_LIFE_STATE::kDying ||
-                   life ==
-                       RE::ACTOR_LIFE_STATE::kDead;
-        }
-
-        struct ProtectionSnapshot
-        {
-            bool essential{};
-            bool protectedFlag{};
-        };
-
-        ProtectionSnapshot ReadProtection(
-            RE::Actor* a_actor)
-        {
-            if (!a_actor) {
-                return {};
-            }
-
-            return {
-                a_actor->IsEssential(),
-                a_actor->IsProtected()
-            };
-        }
-
-        void ClearRuntimeDeathProtection(
-            RE::Actor* a_actor)
-        {
-            if (!a_actor) {
-                return;
-            }
-
-            auto& runtime =
-                a_actor->GetActorRuntimeData();
-
-            runtime.boolFlags.reset(
-                RE::Actor::BOOL_FLAGS::kEssential);
-
-            runtime.boolFlags.reset(
-                RE::Actor::BOOL_FLAGS::kProtected);
-        }
-
-        void RestoreRuntimeDeathProtection(
-            RE::Actor* a_actor,
-            const ProtectionSnapshot& a_snapshot)
-        {
-            if (!a_actor) {
-                return;
-            }
-
-            auto& runtime =
-                a_actor->GetActorRuntimeData();
-
-            if (a_snapshot.essential) {
-                runtime.boolFlags.set(
-                    RE::Actor::BOOL_FLAGS::kEssential);
-            } else {
-                runtime.boolFlags.reset(
-                    RE::Actor::BOOL_FLAGS::kEssential);
-            }
-
-            if (a_snapshot.protectedFlag) {
-                runtime.boolFlags.set(
-                    RE::Actor::BOOL_FLAGS::kProtected);
-            } else {
-                runtime.boolFlags.reset(
-                    RE::Actor::BOOL_FLAGS::kProtected);
-            }
-        }
-
-        bool MarkKillAttemptOnce(
-            RE::FormID a_formID)
-        {
-            std::scoped_lock lock{
-                g_hitMutex
-            };
-
-            const auto [it, inserted] =
-                g_killAttemptedByTarget.emplace(
-                    a_formID,
-                    true);
-
-            return inserted;
         }
 
         std::uintptr_t
@@ -711,6 +902,8 @@ namespace UCA
 
         bool ResolveBypassFunctions()
         {
+            ResolveKillImplIntegrity();
+
             if (g_bypassReady) {
                 return true;
             }
@@ -741,27 +934,6 @@ namespace UCA
                     liveAVOVT,
                     kAVO_ModActorValue);
 
-            static REL::Relocation<
-                std::uintptr_t>
-                actorVTable{
-                    RE::VTABLE_Actor[0]
-                };
-
-            const auto actorVT =
-                actorVTable.address();
-
-            const auto currentKillImpl =
-                *reinterpret_cast<
-                    const std::uintptr_t*>(
-                        actorVT +
-                        kActor_KillImpl *
-                            sizeof(void*));
-
-            const auto pristineKillImpl =
-                g_pristine.ResolveVFunc(
-                    actorVT,
-                    kActor_KillImpl);
-
             logger::info(
                 "[direct-av] live vtable=0x{:X}; current ModActorValue={}; pristine GetActorValue={}; pristine ModActorValue={}",
                 liveAVOVT,
@@ -780,25 +952,8 @@ namespace UCA
                         "<unavailable>"
                     });
 
-            logger::info(
-                "[death-gate] Actor vtable=0x{:X}; current KillImpl={}; pristine KillImpl={}; same={}",
-                actorVT,
-                FormatAddress(
-                    currentKillImpl),
-                pristineKillImpl ?
-                    FormatAddress(
-                        pristineKillImpl) :
-                    std::string{
-                        "<unavailable>"
-                    },
-                pristineKillImpl != 0 &&
-                    currentKillImpl ==
-                        pristineKillImpl);
-
             if (!pristineGet ||
-                !pristineMod ||
-                (g_config.attemptVanillaKillImpl &&
-                 !pristineKillImpl)) {
+                !pristineMod) {
 
                 logger::error(
                     "[direct-av] could not recover pristine ActorValueOwner functions");
@@ -815,20 +970,10 @@ namespace UCA
                     ModActorValue_t>(
                         pristineMod);
 
-            g_vanillaKillImpl =
-                reinterpret_cast<
-                    KillImpl_t>(
-                        pristineKillImpl);
-
             g_bypassReady = true;
 
             logger::info(
                 "[direct-av] universal direct-AV bypass ready");
-
-            if (g_config.attemptVanillaKillImpl) {
-                logger::info(
-                    "[essential-gate] pristine KillImpl death transition probe ready");
-            }
 
             return true;
         }
@@ -913,14 +1058,16 @@ namespace UCA
 
             std::optional<float> after;
 
-            if (g_vanillaGetActorValue) {
+            if (g_config.logHealth &&
+                g_vanillaGetActorValue) {
+
                 after =
                     g_vanillaGetActorValue(
                         avo,
                         RE::ActorValue::kHealth);
             }
 
-            const auto lifeAfterAV =
+            const auto lifeState =
                 GetLifeStateRaw(
                     actor);
 
@@ -934,147 +1081,34 @@ namespace UCA
                     *before,
                     *after,
                     *after - *before,
-                    lifeAfterAV);
+                    lifeState);
             } else {
                 logger::info(
                     "[direct-av:{}] RETURN target=0x{:08X} lifeState={}",
                     a_hitID,
                     a_targetForm,
-                    lifeAfterAV);
+                    lifeState);
             }
 
-            // Essential-gate experiment:
-            // If Bethesda's pristine AV write has made Health <= 0 but the
-            // Actor is still neither dying nor dead, inspect the runtime
-            // Essential/Protected flags.  When enabled, temporarily clear
-            // those generic engine flags and call Bethesda's pristine
-            // Actor::KillImpl exactly once.
-            //
-            // This remains mechanism-level: no NPC name, FormID, plugin name
-            // or third-party RVA is used.
-            if (g_config.attemptVanillaKillImpl &&
-                g_vanillaKillImpl &&
-                after &&
-                *after <= 0.0F &&
-                !IsDyingOrDead(actor) &&
-                MarkKillAttemptOnce(
-                    a_targetForm)) {
+            if (after &&
+                *after <= 0.0F) {
 
-                auto* player =
-                    RE::PlayerCharacter::
-                        GetSingleton();
-
-                const auto lifeBeforeKill =
-                    GetLifeStateRaw(
-                        actor);
-
-                const auto protectionBefore =
-                    ReadProtection(
+                const auto protection =
+                    ReadProtectionSources(
                         actor);
 
                 logger::info(
-                    "[essential-gate:{}] BEFORE target=0x{:08X} health={} lifeState={} essential={} protected={}",
+                    "[kill-source:{}] target=0x{:08X} health={} lifeState={} runtimeEssential={} runtimeProtected={} baseForm=0x{:08X} baseEssential={} baseProtected={} killBytesEqual={}",
                     a_hitID,
                     a_targetForm,
                     *after,
-                    lifeBeforeKill,
-                    protectionBefore.essential,
-                    protectionBefore.protectedFlag);
-
-                if (g_config.bypassEssentialGate) {
-                    ClearRuntimeDeathProtection(
-                        actor);
-                }
-
-                const auto protectionAtCall =
-                    ReadProtection(
-                        actor);
-
-                logger::info(
-                    "[essential-gate:{}] CALL KillImpl target=0x{:08X} essentialAtCall={} protectedAtCall={} attacker={} damage={} sendEvent=true ragdollInstant=false",
-                    a_hitID,
-                    a_targetForm,
-                    protectionAtCall.essential,
-                    protectionAtCall.protectedFlag,
-                    player ?
-                        "player" :
-                        "null",
-                    amount);
-
-                g_vanillaKillImpl(
-                    actor,
-                    player,
-                    amount,
-                    true,
-                    false);
-
-                std::optional<float> healthAfterKill;
-
-                if (g_vanillaGetActorValue) {
-                    healthAfterKill =
-                        g_vanillaGetActorValue(
-                            avo,
-                            RE::ActorValue::kHealth);
-                }
-
-                const auto lifeAfterKill =
-                    GetLifeStateRaw(
-                        actor);
-
-                const bool transitioned =
-                    IsDyingOrDead(
-                        actor);
-
-                const auto protectionAfterKill =
-                    ReadProtection(
-                        actor);
-
-                if (healthAfterKill) {
-                    logger::info(
-                        "[essential-gate:{}] RETURN KillImpl target=0x{:08X} health={} lifeState={} dyingOrDead={} essential={} protected={}",
-                        a_hitID,
-                        a_targetForm,
-                        *healthAfterKill,
-                        lifeAfterKill,
-                        transitioned,
-                        protectionAfterKill.essential,
-                        protectionAfterKill.protectedFlag);
-                } else {
-                    logger::info(
-                        "[essential-gate:{}] RETURN KillImpl target=0x{:08X} lifeState={} dyingOrDead={} essential={} protected={}",
-                        a_hitID,
-                        a_targetForm,
-                        lifeAfterKill,
-                        transitioned,
-                        protectionAfterKill.essential,
-                        protectionAfterKill.protectedFlag);
-                }
-
-                // If the engine still refused to enter Dying/Dead, restore
-                // the pre-test runtime protection flags so the failed probe
-                // does not permanently alter the Actor.
-                if (g_config.bypassEssentialGate &&
-                    !transitioned) {
-
-                    RestoreRuntimeDeathProtection(
-                        actor,
-                        protectionBefore);
-
-                    const auto restored =
-                        ReadProtection(
-                            actor);
-
-                    logger::info(
-                        "[essential-gate:{}] RESTORE target=0x{:08X} essential={} protected={}",
-                        a_hitID,
-                        a_targetForm,
-                        restored.essential,
-                        restored.protectedFlag);
-                } else if (transitioned) {
-                    logger::info(
-                        "[essential-gate:{}] transition accepted; runtime Essential/Protected flags remain cleared for this test session",
-                        a_hitID);
-                }
+                    lifeState,
+                    protection.runtimeEssential,
+                    protection.runtimeProtected,
+                    protection.baseForm,
+                    protection.baseEssential,
+                    protection.baseProtected,
+                    g_killImplBytesEqual);
             }
 
             // One more observation on the next task turn.  This is useful
@@ -1122,15 +1156,33 @@ namespace UCA
                                     nextAVO,
                                     RE::ActorValue::kHealth);
 
+                            const auto nextLife =
+                                GetLifeStateRaw(
+                                    nextActor);
+
                             logger::info(
-                                "[direct-av:{}] NEXT target=0x{:08X} health={} lifeState={} dyingOrDead={}",
+                                "[direct-av:{}] NEXT target=0x{:08X} health={} lifeState={}",
                                 a_hitID,
                                 a_targetForm,
                                 nextHealth,
-                                GetLifeStateRaw(
-                                    nextActor),
-                                IsDyingOrDead(
-                                    nextActor));
+                                nextLife);
+
+                            if (nextHealth <= 0.0F) {
+                                const auto protection =
+                                    ReadProtectionSources(
+                                        nextActor);
+
+                                logger::info(
+                                    "[kill-source:{}] NEXT target=0x{:08X} runtimeEssential={} runtimeProtected={} baseForm=0x{:08X} baseEssential={} baseProtected={} killBytesEqual={}",
+                                    a_hitID,
+                                    a_targetForm,
+                                    protection.runtimeEssential,
+                                    protection.runtimeProtected,
+                                    protection.baseForm,
+                                    protection.baseEssential,
+                                    protection.baseProtected,
+                                    g_killImplBytesEqual);
+                            }
                         });
                 }
             }
@@ -1347,7 +1399,7 @@ namespace UCA
         SetupLog();
 
         logger::info(
-            "UniversalCombatArbiter FINAL Essential-Gate Bypass PoC loading; runtime {}",
+            "UniversalCombatArbiter FINAL Kill-Integrity Probe loading; runtime {}",
             a_skse
                 ->RuntimeVersion()
                 .string());
