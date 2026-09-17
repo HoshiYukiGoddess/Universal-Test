@@ -1,0 +1,69 @@
+name: Build UniversalCombatArbiter DLL
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  COMMONLIB_TAG: v8.1.0
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout this project
+        uses: actions/checkout@v4
+
+      - name: Download CommonLibSSE-NG
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force extern | Out-Null
+          git clone --depth 1 --branch $env:COMMONLIB_TAG --recurse-submodules `
+            https://github.com/alandtse/CommonLibSSE-NG.git extern/CommonLibSSE-NG
+
+      - name: Set up vcpkg
+        shell: pwsh
+        run: |
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git C:\vcpkg
+          & C:\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+
+      - name: Configure with Visual Studio 2022
+        shell: pwsh
+        run: |
+          cmake -S . -B build `
+            -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_TOOLCHAIN_FILE="C:/vcpkg/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_MANIFEST_DIR="${{ github.workspace }}/extern/CommonLibSSE-NG" `
+            -DBUILD_TESTS=OFF `
+            -DENABLE_SKYRIM_SE=ON `
+            -DENABLE_SKYRIM_AE=ON `
+            -DENABLE_SKYRIM_VR=OFF `
+            -DCOMMONLIB_ENABLE_IPO=OFF
+
+      - name: Build Release DLL
+        shell: pwsh
+        run: cmake --build build --config Release --target UniversalCombatArbiter --parallel 2
+
+      - name: Make installable ZIP layout
+        shell: pwsh
+        run: |
+          $out = "artifact/Data/SKSE/Plugins"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          $dll = Get-ChildItem -Path build -Recurse -Filter UniversalCombatArbiter.dll | Select-Object -First 1
+          if (-not $dll) { throw "UniversalCombatArbiter.dll was not produced." }
+          Copy-Item $dll.FullName "$out/UniversalCombatArbiter.dll"
+          Copy-Item "config/UniversalCombatArbiter.ini" "$out/UniversalCombatArbiter.ini"
+          $pdb = Get-ChildItem -Path build -Recurse -Filter UniversalCombatArbiter.pdb | Select-Object -First 1
+          if ($pdb) { Copy-Item $pdb.FullName "$out/UniversalCombatArbiter.pdb" }
+          Get-ChildItem -Recurse artifact
+
+      - name: Upload compiled plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: UniversalCombatArbiter-1.6.1170-PoC
+          path: artifact/**
+          if-no-files-found: error
