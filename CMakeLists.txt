@@ -16,6 +16,7 @@ if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/extern/CommonLibSSE-NG/CMakeLists.txt
 endif()
 
 add_subdirectory(extern/CommonLibSSE-NG CommonLibSSE-NG EXCLUDE_FROM_ALL)
+include("${CMAKE_CURRENT_SOURCE_DIR}/extern/CommonLibSSE-NG/cmake/CommonLibSSE.cmake")
 
 add_commonlibsse_plugin(UniversalCombatArbiter
     NAME "UniversalCombatArbiter"
