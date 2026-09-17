@@ -48,11 +48,11 @@ jobs:
           git clone --depth 1 https://github.com/microsoft/vcpkg.git C:\vcpkg
           & C:\vcpkg\bootstrap-vcpkg.bat -disableMetrics
 
-      - name: Configure
+            - name: Configure
         shell: pwsh
         run: |
           cmake -S . -B build `
-            -G "Visual Studio 18 2026" -A x64
+            -G "Visual Studio 18 2026" -A x64 `
             -DCMAKE_TOOLCHAIN_FILE="C:/vcpkg/scripts/buildsystems/vcpkg.cmake" `
             -DVCPKG_MANIFEST_DIR="${{ github.workspace }}/extern/CommonLibSSE-NG" `
             -DBUILD_TESTS=OFF `
