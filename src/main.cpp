@@ -18,6 +18,7 @@ namespace UCA
             bool playerHasAbsoluteDamage{ true };
             bool logHealth{ true };
             bool attemptVanillaKillImpl{ true };
+            bool bypassEssentialGate{ true };
             float directDamage{ 1000.0F };
             std::uint32_t cooldownMs{ 250 };
         };
@@ -121,6 +122,11 @@ namespace UCA
                     "bAttemptVanillaKillImpl",
                     true);
 
+            g_config.bypassEssentialGate =
+                ReadIniBool(
+                    "bBypassEssentialGate",
+                    true);
+
             g_config.directDamage =
                 std::max(
                     0.0F,
@@ -137,12 +143,13 @@ namespace UCA
                     5000u);
 
             logger::info(
-                "Death-Gate PoC config: player={}, damage={}, cooldown={}ms, logHealth={}, killImpl={}",
+                "Essential-Gate PoC config: player={}, damage={}, cooldown={}ms, logHealth={}, killImpl={}, bypassEssential={}",
                 g_config.playerHasAbsoluteDamage,
                 g_config.directDamage,
                 g_config.cooldownMs,
                 g_config.logHealth,
-                g_config.attemptVanillaKillImpl);
+                g_config.attemptVanillaKillImpl,
+                g_config.bypassEssentialGate);
         }
 
         struct AddressInfo
@@ -599,6 +606,70 @@ namespace UCA
                        RE::ACTOR_LIFE_STATE::kDead;
         }
 
+        struct ProtectionSnapshot
+        {
+            bool essential{};
+            bool protectedFlag{};
+        };
+
+        ProtectionSnapshot ReadProtection(
+            RE::Actor* a_actor)
+        {
+            if (!a_actor) {
+                return {};
+            }
+
+            return {
+                a_actor->IsEssential(),
+                a_actor->IsProtected()
+            };
+        }
+
+        void ClearRuntimeDeathProtection(
+            RE::Actor* a_actor)
+        {
+            if (!a_actor) {
+                return;
+            }
+
+            auto& runtime =
+                a_actor->GetActorRuntimeData();
+
+            runtime.boolFlags.reset(
+                RE::Actor::BOOL_FLAGS::kEssential);
+
+            runtime.boolFlags.reset(
+                RE::Actor::BOOL_FLAGS::kProtected);
+        }
+
+        void RestoreRuntimeDeathProtection(
+            RE::Actor* a_actor,
+            const ProtectionSnapshot& a_snapshot)
+        {
+            if (!a_actor) {
+                return;
+            }
+
+            auto& runtime =
+                a_actor->GetActorRuntimeData();
+
+            if (a_snapshot.essential) {
+                runtime.boolFlags.set(
+                    RE::Actor::BOOL_FLAGS::kEssential);
+            } else {
+                runtime.boolFlags.reset(
+                    RE::Actor::BOOL_FLAGS::kEssential);
+            }
+
+            if (a_snapshot.protectedFlag) {
+                runtime.boolFlags.set(
+                    RE::Actor::BOOL_FLAGS::kProtected);
+            } else {
+                runtime.boolFlags.reset(
+                    RE::Actor::BOOL_FLAGS::kProtected);
+            }
+        }
+
         bool MarkKillAttemptOnce(
             RE::FormID a_formID)
         {
@@ -756,7 +827,7 @@ namespace UCA
 
             if (g_config.attemptVanillaKillImpl) {
                 logger::info(
-                    "[death-gate] pristine KillImpl death transition probe ready");
+                    "[essential-gate] pristine KillImpl death transition probe ready");
             }
 
             return true;
@@ -872,12 +943,15 @@ namespace UCA
                     lifeAfterAV);
             }
 
-            // Death-gate experiment:
-            // For every Actor universally, if Bethesda's pristine AV write
-            // has made Health <= 0 but the Actor is still neither dying nor
-            // dead, call Bethesda's pristine Actor::KillImpl exactly once.
+            // Essential-gate experiment:
+            // If Bethesda's pristine AV write has made Health <= 0 but the
+            // Actor is still neither dying nor dead, inspect the runtime
+            // Essential/Protected flags.  When enabled, temporarily clear
+            // those generic engine flags and call Bethesda's pristine
+            // Actor::KillImpl exactly once.
             //
-            // No NPC name, FormID, plugin name or third-party RVA is used.
+            // This remains mechanism-level: no NPC name, FormID, plugin name
+            // or third-party RVA is used.
             if (g_config.attemptVanillaKillImpl &&
                 g_vanillaKillImpl &&
                 after &&
@@ -894,12 +968,34 @@ namespace UCA
                     GetLifeStateRaw(
                         actor);
 
+                const auto protectionBefore =
+                    ReadProtection(
+                        actor);
+
                 logger::info(
-                    "[death-gate:{}] CALL KillImpl target=0x{:08X} health={} lifeBefore={} attacker={} damage={} sendEvent=true ragdollInstant=false",
+                    "[essential-gate:{}] BEFORE target=0x{:08X} health={} lifeState={} essential={} protected={}",
                     a_hitID,
                     a_targetForm,
                     *after,
                     lifeBeforeKill,
+                    protectionBefore.essential,
+                    protectionBefore.protectedFlag);
+
+                if (g_config.bypassEssentialGate) {
+                    ClearRuntimeDeathProtection(
+                        actor);
+                }
+
+                const auto protectionAtCall =
+                    ReadProtection(
+                        actor);
+
+                logger::info(
+                    "[essential-gate:{}] CALL KillImpl target=0x{:08X} essentialAtCall={} protectedAtCall={} attacker={} damage={} sendEvent=true ragdollInstant=false",
+                    a_hitID,
+                    a_targetForm,
+                    protectionAtCall.essential,
+                    protectionAtCall.protectedFlag,
                     player ?
                         "player" :
                         "null",
@@ -925,23 +1021,59 @@ namespace UCA
                     GetLifeStateRaw(
                         actor);
 
+                const bool transitioned =
+                    IsDyingOrDead(
+                        actor);
+
+                const auto protectionAfterKill =
+                    ReadProtection(
+                        actor);
+
                 if (healthAfterKill) {
                     logger::info(
-                        "[death-gate:{}] RETURN KillImpl target=0x{:08X} health={} lifeAfter={} dyingOrDead={}",
+                        "[essential-gate:{}] RETURN KillImpl target=0x{:08X} health={} lifeState={} dyingOrDead={} essential={} protected={}",
                         a_hitID,
                         a_targetForm,
                         *healthAfterKill,
                         lifeAfterKill,
-                        IsDyingOrDead(
-                            actor));
+                        transitioned,
+                        protectionAfterKill.essential,
+                        protectionAfterKill.protectedFlag);
                 } else {
                     logger::info(
-                        "[death-gate:{}] RETURN KillImpl target=0x{:08X} lifeAfter={} dyingOrDead={}",
+                        "[essential-gate:{}] RETURN KillImpl target=0x{:08X} lifeState={} dyingOrDead={} essential={} protected={}",
                         a_hitID,
                         a_targetForm,
                         lifeAfterKill,
-                        IsDyingOrDead(
-                            actor));
+                        transitioned,
+                        protectionAfterKill.essential,
+                        protectionAfterKill.protectedFlag);
+                }
+
+                // If the engine still refused to enter Dying/Dead, restore
+                // the pre-test runtime protection flags so the failed probe
+                // does not permanently alter the Actor.
+                if (g_config.bypassEssentialGate &&
+                    !transitioned) {
+
+                    RestoreRuntimeDeathProtection(
+                        actor,
+                        protectionBefore);
+
+                    const auto restored =
+                        ReadProtection(
+                            actor);
+
+                    logger::info(
+                        "[essential-gate:{}] RESTORE target=0x{:08X} essential={} protected={}",
+                        a_hitID,
+                        a_targetForm,
+                        restored.essential,
+                        restored.protectedFlag);
+                } else if (transitioned) {
+                    logger::info(
+                        "[essential-gate:{}] transition accepted; runtime Essential/Protected flags remain cleared for this test session",
+                        a_hitID);
                 }
             }
 
@@ -1215,7 +1347,7 @@ namespace UCA
         SetupLog();
 
         logger::info(
-            "UniversalCombatArbiter FINAL Death-Gate PoC loading; runtime {}",
+            "UniversalCombatArbiter FINAL Essential-Gate Bypass PoC loading; runtime {}",
             a_skse
                 ->RuntimeVersion()
                 .string());
